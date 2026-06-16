@@ -1,2 +1,4 @@
 /gh-dashboard
 /gh-dashboard.exe
+/gql/schema.graphql
+/gql/generated.go

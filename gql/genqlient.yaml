@@ -1,0 +1,26 @@
+schema: schema.graphql
+operations:
+  - queries.graphql
+generated: generated.go
+package: gql
+bindings:
+  URI:
+    type: string
+  HTML:
+    type: string
+  GitObjectID:
+    type: string
+  GitTimestamp:
+    type: string
+  DateTime:
+    type: string
+  Date:
+    type: string
+  PreciseDateTime:
+    type: string
+  Base64String:
+    type: string
+  BigInt:
+    type: int64
+  X509Certificate:
+    type: string

@@ -1,0 +1,149 @@
+query GetViewer {
+  viewer {
+    login
+  }
+}
+
+query FetchPRSections($search1: String!, $search2: String!) {
+  awaitingApproval: search(query: $search1, type: ISSUE, first: 50) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        repository {
+          nameWithOwner
+        }
+      }
+    }
+  }
+  changesRequested: search(query: $search2, type: ISSUE, first: 50) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        reviewDecision
+        repository {
+          nameWithOwner
+        }
+      }
+    }
+  }
+}
+
+query FetchOrgProjectItems($org: String!) {
+  organization(login: $org) {
+    projectsV2(first: 20) {
+      nodes {
+        title
+        items(first: 100) {
+          nodes {
+            fieldValues(first: 10) {
+              nodes {
+                ... on ProjectV2ItemFieldSingleSelectValue {
+                  name
+                  field {
+                    ... on ProjectV2SingleSelectField {
+                      name
+                    }
+                  }
+                }
+              }
+            }
+            content {
+              ... on Issue {
+                number
+                title
+                url
+                issueState: state
+                repository {
+                  nameWithOwner
+                }
+                assignees(first: 5) {
+                  nodes {
+                    login
+                  }
+                }
+              }
+              ... on PullRequest {
+                number
+                title
+                url
+                prState: state
+                repository {
+                  nameWithOwner
+                }
+                assignees(first: 5) {
+                  nodes {
+                    login
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+query FetchViewerOrgProjectItems {
+  viewer {
+    organizations(first: 20) {
+      nodes {
+        projectsV2(first: 10) {
+          nodes {
+            title
+            items(first: 50) {
+              nodes {
+                fieldValues(first: 5) {
+                  nodes {
+                    ... on ProjectV2ItemFieldSingleSelectValue {
+                      name
+                      field {
+                        ... on ProjectV2SingleSelectField {
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+                content {
+                  ... on Issue {
+                    number
+                    title
+                    url
+                    issueState: state
+                    repository {
+                      nameWithOwner
+                    }
+                    assignees(first: 5) {
+                      nodes {
+                        login
+                      }
+                    }
+                  }
+                  ... on PullRequest {
+                    number
+                    title
+                    url
+                    prState: state
+                    repository {
+                      nameWithOwner
+                    }
+                    assignees(first: 5) {
+                      nodes {
+                        login
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

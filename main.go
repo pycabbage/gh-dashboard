@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,7 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Khan/genqlient/graphql"
 	"github.com/cli/go-gh/v2/pkg/api"
+	gql "github.com/pycabbage/gh-dashboard/gql"
 )
 
 // ─── ANSI helpers ────────────────────────────────────────────────────────────
@@ -53,196 +56,16 @@ func logMsg(msg string) {
 	fmt.Fprintf(logFile, "[%s] %s\n", ts, msg)
 }
 
-// ─── GraphQL types ────────────────────────────────────────────────────────────
-
-type PRNode struct {
-	Number         int    `json:"number"`
-	Title          string `json:"title"`
-	URL            string `json:"url"`
-	ReviewDecision string `json:"reviewDecision"`
-	Repository     struct {
-		NameWithOwner string `json:"nameWithOwner"`
-	} `json:"repository"`
-}
-
-type PRQueryResponse struct {
-	AwaitingApproval struct {
-		Nodes []PRNode `json:"nodes"`
-	} `json:"awaitingApproval"`
-	ChangesRequested struct {
-		Nodes []PRNode `json:"nodes"`
-	} `json:"changesRequested"`
-}
-
-type FieldValue struct {
-	Name  string `json:"name"`
-	Field struct {
-		Name string `json:"name"`
-	} `json:"field"`
-}
-
-type ContentNode struct {
-	Number     int    `json:"number"`
-	Title      string `json:"title"`
-	URL        string `json:"url"`
-	State      string `json:"state"`
-	Repository struct {
-		NameWithOwner string `json:"nameWithOwner"`
-	} `json:"repository"`
-	Assignees struct {
-		Nodes []struct {
-			Login string `json:"login"`
-		} `json:"nodes"`
-	} `json:"assignees"`
-}
-
-type ProjectItemNode struct {
-	FieldValues struct {
-		Nodes []FieldValue `json:"nodes"`
-	} `json:"fieldValues"`
-	Content *ContentNode `json:"content"`
-}
-
-type ProjectV2Node struct {
-	Title string `json:"title"`
-	Items struct {
-		Nodes []ProjectItemNode `json:"nodes"`
-	} `json:"items"`
-}
-
-type ProjectQueryResponse struct {
-	Organization struct {
-		ProjectsV2 struct {
-			Nodes []ProjectV2Node `json:"nodes"`
-		} `json:"projectsV2"`
-	} `json:"organization"`
-}
-
-type ViewerOrgProjectQueryResponse struct {
-	Viewer struct {
-		Organizations struct {
-			Nodes []struct {
-				ProjectsV2 struct {
-					Nodes []ProjectV2Node `json:"nodes"`
-				} `json:"projectsV2"`
-			} `json:"nodes"`
-		} `json:"organizations"`
-	} `json:"viewer"`
-}
+// ─── DashboardItem ─────────────────────────────────────────────────────────
 
 type DashboardItem struct {
 	Display string
 	URL     string
 }
 
-// ─── Queries ─────────────────────────────────────────────────────────────────
-
-const prQuery = `
-query($search1: String!, $search2: String!) {
-  awaitingApproval: search(query: $search1, type: ISSUE, first: 50) {
-    nodes {
-      ... on PullRequest {
-        number
-        title
-        url
-        repository { nameWithOwner }
-      }
-    }
-  }
-  changesRequested: search(query: $search2, type: ISSUE, first: 50) {
-    nodes {
-      ... on PullRequest {
-        number
-        title
-        url
-        reviewDecision
-        repository { nameWithOwner }
-      }
-    }
-  }
-}
-`
-
-func buildProjectQuery(org string) string {
-	return fmt.Sprintf(`
-query {
-  organization(login: %q) {
-    projectsV2(first: 20) {`, org) + `
-      nodes {
-        title
-        items(first: 100) {
-          nodes {
-            fieldValues(first: 10) {
-              nodes {
-                ... on ProjectV2ItemFieldSingleSelectValue {
-                  name
-                  field { ... on ProjectV2SingleSelectField { name } }
-                }
-              }
-            }
-            content {
-              ... on Issue {
-                number title url state
-                repository { nameWithOwner }
-                assignees(first: 5) { nodes { login } }
-              }
-              ... on PullRequest {
-                number title url state
-                repository { nameWithOwner }
-                assignees(first: 5) { nodes { login } }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}`
-}
-
-const viewerOrgProjectQuery = `
-query {
-  viewer {
-    organizations(first: 20) {
-      nodes {
-        projectsV2(first: 10) {
-          nodes {
-            title
-            items(first: 50) {
-              nodes {
-                fieldValues(first: 5) {
-                  nodes {
-                    ... on ProjectV2ItemFieldSingleSelectValue {
-                      name
-                      field { ... on ProjectV2SingleSelectField { name } }
-                    }
-                  }
-                }
-                content {
-                  ... on Issue {
-                    number title url state
-                    repository { nameWithOwner }
-                    assignees(first: 5) { nodes { login } }
-                  }
-                  ... on PullRequest {
-                    number title url state
-                    repository { nameWithOwner }
-                    assignees(first: 5) { nodes { login } }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-`
-
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
-func fetchPRSections(client *api.GraphQLClient, login, org string) (awaiting []PRNode, changesRequested []PRNode) {
+func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting []DashboardItem, changesRequested []DashboardItem) {
 	search1 := fmt.Sprintf("is:pr is:open review-requested:%s", login)
 	search2 := fmt.Sprintf("is:pr is:open author:%s", login)
 	if org != "" {
@@ -250,120 +73,271 @@ func fetchPRSections(client *api.GraphQLClient, login, org string) (awaiting []P
 		search2 += " org:" + org
 	}
 
-	vars := map[string]any{
-		"search1": search1,
-		"search2": search2,
-	}
-
-	var resp PRQueryResponse
-	err := client.Do(prQuery, vars, &resp)
+	resp, err := gql.FetchPRSections(context.Background(), gqlClient, search1, search2)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[Error] Failed to fetch PR sections: %v\n", err)
 		logMsg(fmt.Sprintf("fetchPRSections error: %v", err))
-		return []PRNode{}, []PRNode{}
+		return []DashboardItem{}, []DashboardItem{}
 	}
 
 	respJSON, _ := json.MarshalIndent(resp, "", "  ")
 	logMsg(fmt.Sprintf("PR query response:\n%s", string(respJSON)))
 
-	for _, n := range resp.AwaitingApproval.Nodes {
-		if n.Number != 0 {
-			awaiting = append(awaiting, n)
+	for _, node := range resp.AwaitingApproval.Nodes {
+		pr, ok := node.(*gql.FetchPRSectionsAwaitingApprovalSearchResultItemConnectionNodesPullRequest)
+		if !ok || pr.Number == 0 {
+			continue
 		}
+		short := repoShortName(pr.Repository.NameWithOwner)
+		display := itemLine(short, pr.Number, pr.Title, MAGENTA)
+		awaiting = append(awaiting, DashboardItem{Display: display, URL: pr.Url})
 	}
 
-	for _, n := range resp.ChangesRequested.Nodes {
-		if n.Number != 0 && n.ReviewDecision == "CHANGES_REQUESTED" {
-			changesRequested = append(changesRequested, n)
+	for _, node := range resp.ChangesRequested.Nodes {
+		pr, ok := node.(*gql.FetchPRSectionsChangesRequestedSearchResultItemConnectionNodesPullRequest)
+		if !ok || pr.Number == 0 {
+			continue
 		}
+		if pr.ReviewDecision != gql.PullRequestReviewDecisionChangesRequested {
+			continue
+		}
+		short := repoShortName(pr.Repository.NameWithOwner)
+		display := itemLine(short, pr.Number, pr.Title, YELLOW)
+		changesRequested = append(changesRequested, DashboardItem{Display: display, URL: pr.Url})
 	}
 
 	if awaiting == nil {
-		awaiting = []PRNode{}
+		awaiting = []DashboardItem{}
 	}
 	if changesRequested == nil {
-		changesRequested = []PRNode{}
+		changesRequested = []DashboardItem{}
 	}
 
 	return awaiting, changesRequested
 }
 
-func processProjectNodes(projects []ProjectV2Node, login string, ready, inProgress *[]DashboardItem) {
-	for _, project := range projects {
-		logMsg(fmt.Sprintf("Project: %q (%d items)", project.Title, len(project.Items.Nodes)))
+// processOrgProjectItem processes a single project item from the FetchOrgProjectItems query.
+func processOrgProjectItem(
+	item gql.FetchOrgProjectItemsOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2Item,
+	login string,
+	ready, inProgress *[]DashboardItem,
+) {
+	content := item.Content
+	if content == nil {
+		logMsg("  → skip: no content")
+		return
+	}
 
-		for _, item := range project.Items.Nodes {
-			content := item.Content
+	var (
+		number    int
+		title     string
+		url       string
+		stateOpen bool
+		repo      string
+		logins    []string
+	)
 
-			contentJSON, _ := json.Marshal(content)
-			fvJSON, _ := json.Marshal(item.FieldValues)
-			logMsg(fmt.Sprintf("  item content: %s", string(contentJSON)))
-			logMsg(fmt.Sprintf("  item fieldValues: %s", string(fvJSON)))
-
-			if content == nil {
-				logMsg("  → skip: no content")
-				continue
-			}
-			if content.Number == 0 || content.Title == "" || content.URL == "" {
-				logMsg("  → skip: missing number/title/url")
-				continue
-			}
-			if content.State != "OPEN" {
-				logMsg(fmt.Sprintf("  → skip: state=%s", content.State))
-				continue
-			}
-
-			assignees := content.Assignees.Nodes
-			isAssigned := false
-			for _, a := range assignees {
-				if a.Login == login {
-					isAssigned = true
-					break
-				}
-			}
-			assigneesJSON, _ := json.Marshal(assignees)
-			logMsg(fmt.Sprintf("  assignees: %s isAssigned=%v", string(assigneesJSON), isAssigned))
-			if !isAssigned {
-				logMsg("  → skip: not assigned")
-				continue
-			}
-
-			var status string
-			for _, fv := range item.FieldValues.Nodes {
-				if strings.Contains(strings.ToLower(fv.Field.Name), "status") && fv.Name != "" {
-					status = fv.Name
-					break
-				}
-			}
-			logMsg(fmt.Sprintf("  status: %s", status))
-			if status == "" {
-				logMsg("  → skip: no status field")
-				continue
-			}
-
-			repo := content.Repository.NameWithOwner
-			if repo == "" {
-				repo = "unknown/unknown"
-			}
-			short := repoShortName(repo)
-			display := itemLine(short, content.Number, content.Title, GREEN)
-			dashItem := DashboardItem{Display: display, URL: content.URL}
-
-			statusLower := strings.ToLower(status)
-			if strings.Contains(statusLower, "ready") {
-				logMsg(fmt.Sprintf("  → Ready: #%d", content.Number))
-				*ready = append(*ready, dashItem)
-			} else if strings.Contains(statusLower, "in progress") {
-				logMsg(fmt.Sprintf("  → In Progress: #%d", content.Number))
-				*inProgress = append(*inProgress, dashItem)
-			} else {
-				logMsg(fmt.Sprintf("  → skip: status=%q (not ready/in progress)", status))
-			}
+	switch c := content.(type) {
+	case *gql.FetchOrgProjectItemsOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2ItemContentIssue:
+		number = c.Number
+		title = c.Title
+		url = c.Url
+		stateOpen = c.IssueState == gql.IssueStateOpen
+		repo = c.Repository.NameWithOwner
+		for _, a := range c.Assignees.Nodes {
+			logins = append(logins, a.Login)
 		}
+	case *gql.FetchOrgProjectItemsOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2ItemContentPullRequest:
+		number = c.Number
+		title = c.Title
+		url = c.Url
+		stateOpen = c.PrState == gql.PullRequestStateOpen
+		repo = c.Repository.NameWithOwner
+		for _, a := range c.Assignees.Nodes {
+			logins = append(logins, a.Login)
+		}
+	default:
+		logMsg("  → skip: not issue or PR")
+		return
+	}
+
+	contentJSON, _ := json.Marshal(map[string]interface{}{"number": number, "title": title, "url": url})
+	logMsg(fmt.Sprintf("  item content: %s", string(contentJSON)))
+
+	if number == 0 || title == "" || url == "" {
+		logMsg("  → skip: missing number/title/url")
+		return
+	}
+	if !stateOpen {
+		logMsg(fmt.Sprintf("  → skip: not open"))
+		return
+	}
+
+	isAssigned := false
+	for _, l := range logins {
+		if l == login {
+			isAssigned = true
+			break
+		}
+	}
+	logMsg(fmt.Sprintf("  assignees: %v isAssigned=%v", logins, isAssigned))
+	if !isAssigned {
+		logMsg("  → skip: not assigned")
+		return
+	}
+
+	var status string
+	for _, fvNode := range item.FieldValues.Nodes {
+		ssv, ok := fvNode.(*gql.FetchOrgProjectItemsOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2ItemFieldValuesProjectV2ItemFieldValueConnectionNodesProjectV2ItemFieldSingleSelectValue)
+		if !ok || ssv.Name == "" {
+			continue
+		}
+		// Get the field name via type switch on Field
+		ssField, ok := ssv.Field.(*gql.FetchOrgProjectItemsOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2ItemFieldValuesProjectV2ItemFieldValueConnectionNodesProjectV2ItemFieldSingleSelectValueFieldProjectV2SingleSelectField)
+		if !ok {
+			continue
+		}
+		if strings.Contains(strings.ToLower(ssField.Name), "status") {
+			status = ssv.Name
+			break
+		}
+	}
+	logMsg(fmt.Sprintf("  status: %s", status))
+	if status == "" {
+		logMsg("  → skip: no status field")
+		return
+	}
+
+	if repo == "" {
+		repo = "unknown/unknown"
+	}
+	short := repoShortName(repo)
+	display := itemLine(short, number, title, GREEN)
+	dashItem := DashboardItem{Display: display, URL: url}
+
+	statusLower := strings.ToLower(status)
+	if strings.Contains(statusLower, "ready") {
+		logMsg(fmt.Sprintf("  → Ready: #%d", number))
+		*ready = append(*ready, dashItem)
+	} else if strings.Contains(statusLower, "in progress") {
+		logMsg(fmt.Sprintf("  → In Progress: #%d", number))
+		*inProgress = append(*inProgress, dashItem)
+	} else {
+		logMsg(fmt.Sprintf("  → skip: status=%q (not ready/in progress)", status))
 	}
 }
 
-func fetchProjectItems(client *api.GraphQLClient, login, org string) (ready []DashboardItem, inProgress []DashboardItem) {
+// processViewerOrgProjectItem processes a single project item from the FetchViewerOrgProjectItems query.
+func processViewerOrgProjectItem(
+	item gql.FetchViewerOrgProjectItemsViewerUserOrganizationsOrganizationConnectionNodesOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2Item,
+	login string,
+	ready, inProgress *[]DashboardItem,
+) {
+	content := item.Content
+	if content == nil {
+		logMsg("  → skip: no content")
+		return
+	}
+
+	var (
+		number    int
+		title     string
+		url       string
+		stateOpen bool
+		repo      string
+		logins    []string
+	)
+
+	switch c := content.(type) {
+	case *gql.FetchViewerOrgProjectItemsViewerUserOrganizationsOrganizationConnectionNodesOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2ItemContentIssue:
+		number = c.Number
+		title = c.Title
+		url = c.Url
+		stateOpen = c.IssueState == gql.IssueStateOpen
+		repo = c.Repository.NameWithOwner
+		for _, a := range c.Assignees.Nodes {
+			logins = append(logins, a.Login)
+		}
+	case *gql.FetchViewerOrgProjectItemsViewerUserOrganizationsOrganizationConnectionNodesOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2ItemContentPullRequest:
+		number = c.Number
+		title = c.Title
+		url = c.Url
+		stateOpen = c.PrState == gql.PullRequestStateOpen
+		repo = c.Repository.NameWithOwner
+		for _, a := range c.Assignees.Nodes {
+			logins = append(logins, a.Login)
+		}
+	default:
+		logMsg("  → skip: not issue or PR")
+		return
+	}
+
+	contentJSON, _ := json.Marshal(map[string]interface{}{"number": number, "title": title, "url": url})
+	logMsg(fmt.Sprintf("  item content: %s", string(contentJSON)))
+
+	if number == 0 || title == "" || url == "" {
+		logMsg("  → skip: missing number/title/url")
+		return
+	}
+	if !stateOpen {
+		logMsg("  → skip: not open")
+		return
+	}
+
+	isAssigned := false
+	for _, l := range logins {
+		if l == login {
+			isAssigned = true
+			break
+		}
+	}
+	logMsg(fmt.Sprintf("  assignees: %v isAssigned=%v", logins, isAssigned))
+	if !isAssigned {
+		logMsg("  → skip: not assigned")
+		return
+	}
+
+	var status string
+	for _, fvNode := range item.FieldValues.Nodes {
+		ssv, ok := fvNode.(*gql.FetchViewerOrgProjectItemsViewerUserOrganizationsOrganizationConnectionNodesOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2ItemFieldValuesProjectV2ItemFieldValueConnectionNodesProjectV2ItemFieldSingleSelectValue)
+		if !ok || ssv.Name == "" {
+			continue
+		}
+		ssField, ok := ssv.Field.(*gql.FetchViewerOrgProjectItemsViewerUserOrganizationsOrganizationConnectionNodesOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2ItemFieldValuesProjectV2ItemFieldValueConnectionNodesProjectV2ItemFieldSingleSelectValueFieldProjectV2SingleSelectField)
+		if !ok {
+			continue
+		}
+		if strings.Contains(strings.ToLower(ssField.Name), "status") {
+			status = ssv.Name
+			break
+		}
+	}
+	logMsg(fmt.Sprintf("  status: %s", status))
+	if status == "" {
+		logMsg("  → skip: no status field")
+		return
+	}
+
+	if repo == "" {
+		repo = "unknown/unknown"
+	}
+	short := repoShortName(repo)
+	display := itemLine(short, number, title, GREEN)
+	dashItem := DashboardItem{Display: display, URL: url}
+
+	statusLower := strings.ToLower(status)
+	if strings.Contains(statusLower, "ready") {
+		logMsg(fmt.Sprintf("  → Ready: #%d", number))
+		*ready = append(*ready, dashItem)
+	} else if strings.Contains(statusLower, "in progress") {
+		logMsg(fmt.Sprintf("  → In Progress: #%d", number))
+		*inProgress = append(*inProgress, dashItem)
+	} else {
+		logMsg(fmt.Sprintf("  → skip: status=%q (not ready/in progress)", status))
+	}
+}
+
+func fetchProjectItems(gqlClient graphql.Client, login, org string) (ready []DashboardItem, inProgress []DashboardItem) {
 	ready = []DashboardItem{}
 	inProgress = []DashboardItem{}
 
@@ -382,22 +356,34 @@ func fetchProjectItems(client *api.GraphQLClient, login, org string) (ready []Da
 	}
 
 	if org != "" {
-		var resp ProjectQueryResponse
-		if err := client.Do(buildProjectQuery(org), nil, &resp); handleErr(err) {
+		resp, err := gql.FetchOrgProjectItems(context.Background(), gqlClient, org)
+		if handleErr(err) {
 			return
 		}
 		respJSON, _ := json.MarshalIndent(resp, "", "  ")
 		logMsg(fmt.Sprintf("Project query raw response:\n%s", string(respJSON)))
-		processProjectNodes(resp.Organization.ProjectsV2.Nodes, login, &ready, &inProgress)
+
+		for _, project := range resp.Organization.ProjectsV2.Nodes {
+			logMsg(fmt.Sprintf("Project: %q (%d items)", project.Title, len(project.Items.Nodes)))
+			for _, item := range project.Items.Nodes {
+				processOrgProjectItem(item, login, &ready, &inProgress)
+			}
+		}
 	} else {
-		var resp ViewerOrgProjectQueryResponse
-		if err := client.Do(viewerOrgProjectQuery, nil, &resp); handleErr(err) {
+		resp, err := gql.FetchViewerOrgProjectItems(context.Background(), gqlClient)
+		if handleErr(err) {
 			return
 		}
 		respJSON, _ := json.MarshalIndent(resp, "", "  ")
 		logMsg(fmt.Sprintf("Viewer org project query raw response:\n%s", string(respJSON)))
+
 		for _, orgNode := range resp.Viewer.Organizations.Nodes {
-			processProjectNodes(orgNode.ProjectsV2.Nodes, login, &ready, &inProgress)
+			for _, project := range orgNode.ProjectsV2.Nodes {
+				logMsg(fmt.Sprintf("Project: %q (%d items)", project.Title, len(project.Items.Nodes)))
+				for _, item := range project.Items.Nodes {
+					processViewerOrgProjectItem(item, login, &ready, &inProgress)
+				}
+			}
 		}
 	}
 
@@ -406,17 +392,15 @@ func fetchProjectItems(client *api.GraphQLClient, login, org string) (ready []Da
 
 // ─── Build fzf lines ──────────────────────────────────────────────────────────
 
-func buildLines(awaiting, changesRequested []PRNode, ready, inProgress []DashboardItem) []string {
+func buildLines(awaiting, changesRequested []DashboardItem, ready, inProgress []DashboardItem) []string {
 	var lines []string
 
 	lines = append(lines, sectionHeader("Awaiting Approval")+"\t")
 	if len(awaiting) == 0 {
 		lines = append(lines, "  (none)\t")
 	} else {
-		for _, pr := range awaiting {
-			short := repoShortName(pr.Repository.NameWithOwner)
-			display := itemLine(short, pr.Number, pr.Title, MAGENTA)
-			lines = append(lines, display+"\t"+pr.URL)
+		for _, item := range awaiting {
+			lines = append(lines, item.Display+"\t"+item.URL)
 		}
 	}
 
@@ -426,10 +410,8 @@ func buildLines(awaiting, changesRequested []PRNode, ready, inProgress []Dashboa
 	if len(changesRequested) == 0 {
 		lines = append(lines, "  (none)\t")
 	} else {
-		for _, pr := range changesRequested {
-			short := repoShortName(pr.Repository.NameWithOwner)
-			display := itemLine(short, pr.Number, pr.Title, YELLOW)
-			lines = append(lines, display+"\t"+pr.URL)
+		for _, item := range changesRequested {
+			lines = append(lines, item.Display+"\t"+item.URL)
 		}
 	}
 
@@ -562,19 +544,14 @@ func main() {
 
 	logMsg(fmt.Sprintf("Starting gh-dashboard (dry-run=%v)", *dryRun))
 
-	client, err := api.DefaultGraphQLClient()
+	httpClient, err := api.NewHTTPClient(api.ClientOptions{})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[Error] Failed to create GraphQL client: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[Error] Failed to create HTTP client: %v\n", err)
 		os.Exit(1)
 	}
+	gqlClient := graphql.NewClient("https://api.github.com/graphql", httpClient)
 
-	// Get authenticated user via GraphQL viewer query.
-	var viewerResp struct {
-		Viewer struct {
-			Login string `json:"login"`
-		} `json:"viewer"`
-	}
-	err = client.Do("query { viewer { login } }", nil, &viewerResp)
+	viewerResp, err := gql.GetViewer(context.Background(), gqlClient)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[Error] Failed to get authenticated user: %v\n", err)
 		os.Exit(1)
@@ -591,8 +568,8 @@ func main() {
 
 	// Parallel fetch.
 	var (
-		awaiting         []PRNode
-		changesRequested []PRNode
+		awaiting         []DashboardItem
+		changesRequested []DashboardItem
 		ready            []DashboardItem
 		inProgress       []DashboardItem
 		wg               sync.WaitGroup
@@ -602,12 +579,12 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		awaiting, changesRequested = fetchPRSections(client, login, *org)
+		awaiting, changesRequested = fetchPRSections(gqlClient, login, *org)
 	}()
 
 	go func() {
 		defer wg.Done()
-		ready, inProgress = fetchProjectItems(client, login, *org)
+		ready, inProgress = fetchProjectItems(gqlClient, login, *org)
 	}()
 
 	wg.Wait()
@@ -630,3 +607,4 @@ func main() {
 
 	launchFzf(lines)
 }
+
