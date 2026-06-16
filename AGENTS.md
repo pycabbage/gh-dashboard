@@ -8,9 +8,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # ビルド
 go build -o gh-dashboard .
 
+# 実行（gh extension として）
+gh dashboard
+gh dashboard --org <org-name>
+
 # dry-run（fzf を起動せずプレーンテキスト出力）
 ./gh-dashboard --dry-run
 ./gh-dashboard --org <org-name> --dry-run
+
+# デバッグログ出力（--dry-run と組み合わせ可能）
+./gh-dashboard --log /tmp/gh-dashboard.log --dry-run
 
 # GraphQL コード生成（queries.graphql を変更した後に実行）
 go generate ./gql/...
@@ -62,10 +69,22 @@ genqlient は クエリごとに異なる Go 型を生成するため、`FetchOr
 - 自分がアサインされている
 - `Status` フィールドの値が `"ready"` または `"in progress"` を含む（case-insensitive）
 
+### fzf のプレビューパネル
+
+fzf 起動後、矢印キーでプレビュー内容を切り替えられる：
+
+| キー | 表示内容 |
+|------|---------|
+| デフォルト | Details（`gh pr view` / `gh issue view`） |
+| `→` | Comments（`gh pr view --comments` 等） |
+| `←` | Repository（`gh repo view`） |
+
+プレビューコマンドは `GH_FORCE_TTY=1`・`GLAMOUR_STYLE=dark`・`CLICOLOR_FORCE=1` を付与して実行することで、パイプ経由でも markdown レンダリングが有効になる。
+
 ### fzf 起動の注意点
 
 日本語ロケール（`ja_JP.UTF-8`）では `mattn/go-runewidth` がボーダー罫線文字を幅2として扱い表示が崩れるため、`RUNEWIDTH_EASTASIAN=0` を環境変数に付与して起動する。
 
-### WSL2 でのブラウザ起動
+### ブラウザ起動
 
-`wslview` → `cmd.exe /c start` → `powershell.exe Start-Process` の順でフォールバック。
+`github.com/cli/browser` パッケージ（`browser.New`）に委譲しており、WSL2 でのブラウザ起動もそのパッケージが処理する。`Browse` が失敗した場合のみ URL をそのまま標準出力に表示する。

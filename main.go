@@ -26,14 +26,22 @@ const (
 	CYAN    = "\x1b[36m"
 	GREEN   = "\x1b[32m"
 	MAGENTA = "\x1b[35m"
+	BLUE    = "\x1b[34m"
 )
 
 func sectionHeader(label string) string {
 	return BOLD + YELLOW + "── " + label + " ──" + RESET
 }
 
-func itemLine(repoShort string, number int, title string, color string) string {
-	return fmt.Sprintf("  %s%s%s  %s#%d%s  %s", color, repoShort, RESET, CYAN, number, RESET, title)
+func itemLine(repoShort string, number int, title string, color string, itemType string) string {
+	var badge string
+	switch itemType {
+	case "pr":
+		badge = BLUE + "PR" + RESET + "  "
+	case "issue":
+		badge = GREEN + "IS" + RESET + "  "
+	}
+	return fmt.Sprintf("  %s%s%s  %s#%d%s  %s%s", color, repoShort, RESET, CYAN, number, RESET, badge, title)
 }
 
 func repoShortName(nameWithOwner string) string {
@@ -95,7 +103,7 @@ func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting []Da
 			continue
 		}
 		short := repoShortName(pr.Repository.NameWithOwner)
-		awaiting = append(awaiting, DashboardItem{Display: itemLine(short, pr.Number, pr.Title, MAGENTA), URL: pr.Url})
+		awaiting = append(awaiting, DashboardItem{Display: itemLine(short, pr.Number, pr.Title, MAGENTA, "pr"), URL: pr.Url})
 	}
 
 	for _, node := range resp.ChangesRequested.Nodes {
@@ -104,7 +112,7 @@ func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting []Da
 			continue
 		}
 		short := repoShortName(pr.Repository.NameWithOwner)
-		changesRequested = append(changesRequested, DashboardItem{Display: itemLine(short, pr.Number, pr.Title, YELLOW), URL: pr.Url})
+		changesRequested = append(changesRequested, DashboardItem{Display: itemLine(short, pr.Number, pr.Title, YELLOW, "pr"), URL: pr.Url})
 	}
 
 	return awaiting, changesRequested
@@ -119,6 +127,7 @@ type projectItemData struct {
 	repo      string
 	logins    []string
 	status    string
+	itemType  string // "pr" or "issue"
 }
 
 // classifyProjectItem filters and appends a project item to ready or inProgress.
@@ -157,7 +166,7 @@ func classifyProjectItem(d projectItemData, login string, ready, inProgress *[]D
 	if repo == "" {
 		repo = "unknown/unknown"
 	}
-	dashItem := DashboardItem{Display: itemLine(repoShortName(repo), d.number, d.title, GREEN), URL: d.url}
+	dashItem := DashboardItem{Display: itemLine(repoShortName(repo), d.number, d.title, GREEN, d.itemType), URL: d.url}
 
 	statusLower := strings.ToLower(d.status)
 	switch {
@@ -186,12 +195,12 @@ func processOrgProjectItem(
 	var d projectItemData
 	switch c := content.(type) {
 	case *gql.FetchOrgProjectItemsOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2ItemContentIssue:
-		d = projectItemData{number: c.Number, title: c.Title, url: c.Url, stateOpen: c.IssueState == gql.IssueStateOpen, repo: c.Repository.NameWithOwner}
+		d = projectItemData{number: c.Number, title: c.Title, url: c.Url, stateOpen: c.IssueState == gql.IssueStateOpen, repo: c.Repository.NameWithOwner, itemType: "issue"}
 		for _, a := range c.Assignees.Nodes {
 			d.logins = append(d.logins, a.Login)
 		}
 	case *gql.FetchOrgProjectItemsOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2ItemContentPullRequest:
-		d = projectItemData{number: c.Number, title: c.Title, url: c.Url, stateOpen: c.PrState == gql.PullRequestStateOpen, repo: c.Repository.NameWithOwner}
+		d = projectItemData{number: c.Number, title: c.Title, url: c.Url, stateOpen: c.PrState == gql.PullRequestStateOpen, repo: c.Repository.NameWithOwner, itemType: "pr"}
 		for _, a := range c.Assignees.Nodes {
 			d.logins = append(d.logins, a.Login)
 		}
@@ -232,12 +241,12 @@ func processViewerOrgProjectItem(
 	var d projectItemData
 	switch c := content.(type) {
 	case *gql.FetchViewerOrgProjectItemsViewerUserOrganizationsOrganizationConnectionNodesOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2ItemContentIssue:
-		d = projectItemData{number: c.Number, title: c.Title, url: c.Url, stateOpen: c.IssueState == gql.IssueStateOpen, repo: c.Repository.NameWithOwner}
+		d = projectItemData{number: c.Number, title: c.Title, url: c.Url, stateOpen: c.IssueState == gql.IssueStateOpen, repo: c.Repository.NameWithOwner, itemType: "issue"}
 		for _, a := range c.Assignees.Nodes {
 			d.logins = append(d.logins, a.Login)
 		}
 	case *gql.FetchViewerOrgProjectItemsViewerUserOrganizationsOrganizationConnectionNodesOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2ItemContentPullRequest:
-		d = projectItemData{number: c.Number, title: c.Title, url: c.Url, stateOpen: c.PrState == gql.PullRequestStateOpen, repo: c.Repository.NameWithOwner}
+		d = projectItemData{number: c.Number, title: c.Title, url: c.Url, stateOpen: c.PrState == gql.PullRequestStateOpen, repo: c.Repository.NameWithOwner, itemType: "pr"}
 		for _, a := range c.Assignees.Nodes {
 			d.logins = append(d.logins, a.Login)
 		}
@@ -350,6 +359,46 @@ func launchFzf(lines []string) {
 		return
 	}
 
+	// buildShellPreview builds an fzf preview command string safe for use inside change-preview(…).
+	// ifBranches is a partial "if … ; elif … ;" chain (no trailing else/fi) — no ")" in pattern
+	// positions — so fzf's paren-depth parser never closes the change-preview( prematurely.
+	// leftHint / rightHint are dim navigation labels shown at the bottom of the preview panel.
+	//
+	// Notes on the shell template:
+	//   • GLAMOUR_STYLE is hardcoded to prevent fzf from treating ${GLAMOUR_STYLE:-dark} braces
+	//     as a template placeholder and wiping the value.
+	//   • GH_FORCE_TTY=1 makes gh render markdown via glamour even when stdout is a pipe.
+	//   • ${#L} / ${#R} are POSIX string-length expansions, NOT fzf placeholders.
+	buildShellPreview := func(ifBranches, leftHint, rightHint string) string {
+		s := `url={2}; ` + ifBranches + ` else echo 'Select an item to preview'; fi`
+		if leftHint != "" || rightHint != "" {
+			s += `; if printf '%s' "$url" | grep -q '^http'; then ` +
+				`L=` + fmt.Sprintf("%q", leftHint) + `; R=` + fmt.Sprintf("%q", rightHint) + `; ` +
+				`printf '\n\033[2m%s%*s%s\033[0m' "$L" "$((FZF_PREVIEW_COLUMNS - ${#L} - ${#R}))" "" "$R"` +
+				`; fi`
+		}
+		return s
+	}
+
+	ghEnv := `CLICOLOR_FORCE=1 GLAMOUR_STYLE=dark GH_FORCE_TTY=1`
+
+	detailsPreview := buildShellPreview(
+		`if printf '%s' "$url" | grep -q '/pull/'; then `+ghEnv+` gh pr view "$url"; `+
+			`elif printf '%s' "$url" | grep -q '/issues/'; then `+ghEnv+` gh issue view "$url";`,
+		"← Repository", "Comments →",
+	)
+	commentsPreview := buildShellPreview(
+		`if printf '%s' "$url" | grep -q '/pull/'; then `+ghEnv+` gh pr view --comments "$url"; `+
+			`elif printf '%s' "$url" | grep -q '/issues/'; then `+ghEnv+` gh issue view --comments "$url";`,
+		"← Repository", "",
+	)
+	repoPreview := buildShellPreview(
+		`if printf '%s' "$url" | grep -q '^http'; then `+
+			`repo=$(printf '%s' "$url" | sed 's|https://github.com/||; s|/pull/.*||; s|/issues/.*||'); `+
+			ghEnv+` gh repo view "$repo";`,
+		"", "Details →",
+	)
+
 	cmd := exec.Command(
 		"fzf",
 		"--ansi",
@@ -358,6 +407,11 @@ func launchFzf(lines []string) {
 		"--delimiter=\t",
 		"--with-nth=1",
 		"--no-sort",
+		"--preview", detailsPreview,
+		"--preview-label", " Details ",
+		"--preview-window", "right:55%:wrap",
+		"--bind", "right:change-preview-label( Comments )+change-preview("+commentsPreview+")+preview-top",
+		"--bind", "left:change-preview-label( Repository )+change-preview("+repoPreview+")+preview-top",
 	)
 	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n"))
 	cmd.Stderr = os.Stderr
