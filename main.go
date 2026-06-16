@@ -45,9 +45,9 @@ func itemLine(repoShort string, number int, title string, color string, itemType
 }
 
 func repoShortName(nameWithOwner string) string {
-	parts := strings.SplitN(nameWithOwner, "/", 2)
-	if len(parts) == 2 {
-		return parts[1]
+	_, after, ok := strings.Cut(nameWithOwner, "/")
+	if ok {
+		return after
 	}
 	return nameWithOwner
 }
@@ -88,20 +88,12 @@ func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting []Da
 		return
 	}
 
-	if logFile != nil {
-		for _, node := range resp.AwaitingApproval.Nodes {
-			pr, ok := node.(*gql.FetchPRSectionsAwaitingApprovalSearchResultItemConnectionNodesPullRequest)
-			if ok {
-				logMsg(fmt.Sprintf("awaiting: #%d %s", pr.Number, pr.Title))
-			}
-		}
-	}
-
 	for _, node := range resp.AwaitingApproval.Nodes {
 		pr, ok := node.(*gql.FetchPRSectionsAwaitingApprovalSearchResultItemConnectionNodesPullRequest)
 		if !ok || pr.Number == 0 {
 			continue
 		}
+		logMsg(fmt.Sprintf("awaiting: #%d %s", pr.Number, pr.Title))
 		short := repoShortName(pr.Repository.NameWithOwner)
 		awaiting = append(awaiting, DashboardItem{Display: itemLine(short, pr.Number, pr.Title, MAGENTA, "pr"), URL: pr.Url})
 	}
@@ -319,26 +311,35 @@ func fetchProjectItems(gqlClient graphql.Client, login, org string) (ready []Das
 
 // ─── Build fzf lines ──────────────────────────────────────────────────────────
 
-func appendSection(lines *[]string, header string, items []DashboardItem) {
-	*lines = append(*lines, sectionHeader(header)+"\t")
+func appendSection(lines []string, header string, items []DashboardItem) []string {
+	lines = append(lines, sectionHeader(header)+"\t")
 	if len(items) == 0 {
-		*lines = append(*lines, "  (none)\t")
+		lines = append(lines, "  (none)\t")
 	} else {
 		for _, item := range items {
-			*lines = append(*lines, item.Display+"\t"+item.URL)
+			lines = append(lines, item.Display+"\t"+item.URL)
 		}
 	}
+	return lines
 }
 
 func buildLines(awaiting, changesRequested, ready, inProgress []DashboardItem) []string {
+	sections := []struct {
+		header string
+		items  []DashboardItem
+	}{
+		{"Awaiting Approval", awaiting},
+		{"Changes Requested", changesRequested},
+		{"Ready", ready},
+		{"In Progress", inProgress},
+	}
 	var lines []string
-	appendSection(&lines, "Awaiting Approval", awaiting)
-	lines = append(lines, "\t")
-	appendSection(&lines, "Changes Requested", changesRequested)
-	lines = append(lines, "\t")
-	appendSection(&lines, "Ready", ready)
-	lines = append(lines, "\t")
-	appendSection(&lines, "In Progress", inProgress)
+	for i, s := range sections {
+		lines = appendSection(lines, s.header, s.items)
+		if i < len(sections)-1 {
+			lines = append(lines, "\t")
+		}
+	}
 	return lines
 }
 
@@ -346,8 +347,8 @@ func buildLines(awaiting, changesRequested, ready, inProgress []DashboardItem) [
 
 func printPlain(lines []string) {
 	for _, l := range lines {
-		parts := strings.SplitN(l, "\t", 2)
-		fmt.Println(parts[0])
+		display, _, _ := strings.Cut(l, "\t")
+		fmt.Println(display)
 	}
 }
 
@@ -428,11 +429,11 @@ func launchFzf(lines []string) {
 		return
 	}
 
-	parts := strings.SplitN(selected, "\t", 2)
-	if len(parts) < 2 {
+	_, urlPart, ok := strings.Cut(selected, "\t")
+	if !ok {
 		return
 	}
-	url := strings.TrimSpace(parts[1])
+	url := strings.TrimSpace(urlPart)
 	if !strings.HasPrefix(url, "http") {
 		return
 	}
@@ -481,13 +482,12 @@ func main() {
 	}
 	login := viewerResp.Viewer.Login
 
+	orgSuffix := ""
 	if *org != "" {
-		fmt.Fprintf(os.Stderr, "[Info] Fetching dashboard for: %s (org: %s)\n", login, *org)
-		logMsg(fmt.Sprintf("Authenticated as: %s (org: %s)", login, *org))
-	} else {
-		fmt.Fprintf(os.Stderr, "[Info] Fetching dashboard for: %s\n", login)
-		logMsg(fmt.Sprintf("Authenticated as: %s", login))
+		orgSuffix = " (org: " + *org + ")"
 	}
+	fmt.Fprintf(os.Stderr, "[Info] Fetching dashboard for: %s%s\n", login, orgSuffix)
+	logMsg(fmt.Sprintf("Authenticated as: %s%s", login, orgSuffix))
 
 	var (
 		awaiting         []DashboardItem
