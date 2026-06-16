@@ -5,8 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -391,6 +393,16 @@ func buildLines(sections []section) []string {
 
 // ─── fzf launcher ─────────────────────────────────────────────────────────────
 
+// findFreePort returns a free localhost TCP port, or 0 on failure.
+func findFreePort() int {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = l.Close() }()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
 func printPlain(lines []string) {
 	for _, l := range lines {
 		display, _, _ := strings.Cut(l, "\t")
@@ -406,60 +418,114 @@ func launchFzf(lines []string) {
 		return
 	}
 
-	// buildShellPreview builds an fzf preview command string safe for use inside change-preview(…).
-	// ifBranches is a partial "if … ; elif … ;" chain (no trailing else/fi) — no ")" in pattern
-	// positions — so fzf's paren-depth parser never closes the change-preview( prematurely.
-	// leftHint / rightHint are dim navigation labels shown at the bottom of the preview panel.
-	//
-	// Notes on the shell template:
-	//   • GLAMOUR_STYLE is hardcoded to prevent fzf from treating ${GLAMOUR_STYLE:-dark} braces
-	//     as a template placeholder and wiping the value.
-	//   • GH_FORCE_TTY=1 makes gh render markdown via glamour even when stdout is a pipe.
-	//   • ${#L} / ${#R} are POSIX string-length expansions, NOT fzf placeholders.
-	buildShellPreview := func(ifBranches, leftHint, rightHint string) string {
-		s := `url={2}; ` + ifBranches + ` else echo 'Select an item to preview'; fi`
-		if leftHint != "" || rightHint != "" {
-			s += `; if printf '%s' "$url" | grep -q '^http'; then ` +
-				`L=` + fmt.Sprintf("%q", leftHint) + `; R=` + fmt.Sprintf("%q", rightHint) + `; ` +
-				`printf '\n\033[2m%s%*s%s\033[0m' "$L" "$((FZF_PREVIEW_COLUMNS - ${#L} - ${#R}))" "" "$R"` +
-				`; fi`
-		}
-		return s
+	// State file tracks current preview mode across key presses.
+	stateFile, err := os.CreateTemp("", "gh-dashboard-state-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[Error] Cannot create state file: %v\n", err)
+		printPlain(lines)
+		return
 	}
+	defer func() { _ = os.Remove(stateFile.Name()) }()
+	if _, err := stateFile.WriteString("details"); err != nil {
+		printPlain(lines)
+		return
+	}
+	if err := stateFile.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "[Error] Cannot close state file: %v\n", err)
+		printPlain(lines)
+		return
+	}
+	sf := stateFile.Name()
+
+	// fzf --listen port lets execute-silent post label-update actions back to fzf.
+	port := findFreePort()
 
 	ghEnv := `CLICOLOR_FORCE=1 GLAMOUR_STYLE=dark GH_FORCE_TTY=1`
 
-	detailsPreview := buildShellPreview(
-		`if printf '%s' "$url" | grep -q '/pull/'; then `+ghEnv+` gh pr view "$url"; `+
-			`elif printf '%s' "$url" | grep -q '/issues/'; then `+ghEnv+` gh issue view "$url";`,
-		"← Repository", "Comments →",
-	)
-	commentsPreview := buildShellPreview(
-		`if printf '%s' "$url" | grep -q '/pull/'; then `+ghEnv+` gh pr view --comments "$url"; `+
-			`elif printf '%s' "$url" | grep -q '/issues/'; then `+ghEnv+` gh issue view --comments "$url";`,
-		"← Repository", "",
-	)
-	repoPreview := buildShellPreview(
-		`if printf '%s' "$url" | grep -q '^http'; then `+
-			`repo=$(printf '%s' "$url" | sed 's|https://github.com/||; s|/pull/.*||; s|/issues/.*||'); `+
-			ghEnv+` gh repo view "$repo";`,
-		"", "Details →",
-	)
+	// Unified preview command that reads sf and shows the appropriate content.
+	// Notes:
+	//   • GLAMOUR_STYLE is hardcoded to prevent fzf from substituting ${...} templates.
+	//   • ${#L} / ${#R} are POSIX string-length expansions, NOT fzf placeholders.
+	previewScript := `url={2}; state=$(cat ` + sf + `); ` +
+		`if printf '%s' "$url" | grep -q '/pull/'; then ` +
+		`case "$state" in ` +
+		`details) ` + ghEnv + ` gh pr view "$url";; ` +
+		`comments) ` + ghEnv + ` gh pr view --comments "$url";; ` +
+		`*) repo=$(printf '%s' "$url" | sed 's|https://github.com/||; s|/pull/.*||'); ` + ghEnv + ` gh repo view "$repo";; ` +
+		`esac; ` +
+		`elif printf '%s' "$url" | grep -q '/issues/'; then ` +
+		`case "$state" in ` +
+		`details) ` + ghEnv + ` gh issue view "$url";; ` +
+		`comments) ` + ghEnv + ` gh issue view --comments "$url";; ` +
+		`*) repo=$(printf '%s' "$url" | sed 's|https://github.com/||; s|/issues/.*||'); ` + ghEnv + ` gh repo view "$repo";; ` +
+		`esac; ` +
+		`else echo 'Select an item to preview'; fi; ` +
+		`if printf '%s' "$url" | grep -q '^http'; then ` +
+		`case "$state" in ` +
+		`details) L="← Repository"; R="Comments →";; ` +
+		`comments) L="← Details"; R="Repository →";; ` +
+		`*) L="← Comments"; R="Details →";; ` +
+		`esac; ` +
+		`printf '\n\033[2m%s%*s%s\033[0m' "$L" "$((FZF_PREVIEW_COLUMNS - ${#L} - ${#R}))" "" "$R"; ` +
+		`fi`
 
-	cmd := exec.Command(
-		"fzf",
+	// buildCycleBind returns an execute-silent action that advances (forward=true) or
+	// reverses the 3-state cycle details→comments→repository→details, then POSTs
+	// change-preview-label+preview-reload to fzf's --listen server for atomic label update.
+	// When no port is available the label is not updated but navigation still works.
+	//
+	// IMPORTANT: Two fzf parser pitfalls to avoid:
+	//
+	// 1. execute-silent(CMD) uses balanced-parenthesis matching to find the end of CMD.
+	//    Any bare ) inside CMD — e.g. from "case ... in pattern)" — closes the block
+	//    prematurely.  We use if/elif/fi instead (no unbalanced parens).
+	//
+	// 2. Even with if/elif, the string `change-preview-label(%s)` contains a ) that
+	//    closes the execute-silent block before the curl pipeline runs, leaving
+	//    `+refresh-preview+preview-top' "$nl" | curl ...` to be parsed as fzf action
+	//    names → "unknown action: preview-top'...".
+	//
+	//    Fix: use the colon syntax  execute-silent:CMD  which consumes the rest of the
+	//    bind string verbatim (no parenthesis parsing).  Then send refresh-preview and
+	//    preview-top as part of the curl POST body so fzf still executes them.
+	buildCycleBind := func(forward bool) string {
+		var transitions string
+		if forward {
+			transitions = `if [ "$state" = details ]; then ns=comments; nl=" Comments "; elif [ "$state" = comments ]; then ns=repository; nl=" Repository "; else ns=details; nl=" Details "; fi`
+		} else {
+			transitions = `if [ "$state" = details ]; then ns=repository; nl=" Repository "; elif [ "$state" = repository ]; then ns=comments; nl=" Comments "; else ns=details; nl=" Details "; fi`
+		}
+		stateUpdate := `state=$(cat ` + sf + `); ` + transitions + `; printf '%s' "$ns" > ` + sf
+		if port > 0 {
+			// Colon syntax: execute-silent:CMD — no paren parsing, CMD runs to end of string.
+			// refresh-preview and preview-top are sent via the curl POST body so fzf
+			// executes them after the label update without needing to chain them here.
+			return `execute-silent:` + stateUpdate + `; ` +
+				`printf 'change-preview-label(%s)+refresh-preview+preview-top' "$nl" | ` +
+				`curl -s -X POST localhost:` + strconv.Itoa(port) + ` -H 'content-type: text/plain' -d @-`
+		}
+		// No --listen port: state file update only; paren syntax is safe here because
+		// stateUpdate (if/elif/fi + printf) contains only balanced parentheses.
+		return `execute-silent(` + stateUpdate + `)+refresh-preview+preview-top`
+	}
+
+	fzfArgs := []string{
 		"--ansi",
 		"--layout=reverse",
 		"--border",
 		"--delimiter=\t",
 		"--with-nth=1",
 		"--no-sort",
-		"--preview", detailsPreview,
+		"--preview", previewScript,
 		"--preview-label", " Details ",
 		"--preview-window", "right:55%:wrap",
-		"--bind", "right:change-preview-label( Comments )+change-preview("+commentsPreview+")+preview-top",
-		"--bind", "left:change-preview-label( Repository )+change-preview("+repoPreview+")+preview-top",
-	)
+		"--bind", "right:" + buildCycleBind(true),
+		"--bind", "left:" + buildCycleBind(false),
+	}
+	if port > 0 {
+		fzfArgs = append(fzfArgs, "--listen", ":"+strconv.Itoa(port))
+	}
+	cmd := exec.Command("fzf", fzfArgs...)
 	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n"))
 	cmd.Stderr = os.Stderr
 	// RUNEWIDTH_EASTASIAN=0 prevents fzf from treating box-drawing chars as

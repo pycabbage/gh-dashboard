@@ -19,6 +19,14 @@ gh dashboard --org <org-name>
 # デバッグログ出力（--dry-run と組み合わせ可能）
 ./gh-dashboard --log /tmp/gh-dashboard.log --dry-run
 
+# fzf など対話的 CLI のテストは必ず subagent 内で tmux 経由で行うこと
+# （メインセッションから直接 fzf を起動しても TTY がなく動かない）
+tmux new-session -d -s fzf-test
+tmux send-keys -t fzf-test "./gh-dashboard" Enter
+tmux send-keys -t fzf-test $'\x1b[C' ""   # → キーなど
+tmux capture-pane -t fzf-test -p
+tmux kill-session -t fzf-test
+
 # GraphQL コード生成（queries.graphql を変更した後に実行）
 go generate ./gql/...
 
