@@ -24,7 +24,7 @@ jobs:
           go-version-file: go.mod
       - name: Generate GraphQL code
         run: |
-          curl -sSL https://docs.github.com/public/schema.docs.graphql -o gql/schema.graphql
+          curl -sSL https://docs.github.com/public/fpt/schema.docs.graphql -o gql/schema.graphql
           go generate ./gql/...
       - uses: cli/gh-extension-precompile@v2
         with:
