@@ -13,6 +13,7 @@ import (
 
 	"github.com/Khan/genqlient/graphql"
 	"github.com/cli/go-gh/v2/pkg/api"
+	"github.com/cli/go-gh/v2/pkg/browser"
 	gql "github.com/pycabbage/gh-dashboard/gql"
 )
 
@@ -271,7 +272,7 @@ func fetchProjectItems(gqlClient graphql.Client, login, org string) (ready []Das
 		msg := err.Error()
 		logMsg(fmt.Sprintf("fetchProjectItems error: %s", msg))
 		if strings.Contains(msg, "required scopes") || strings.Contains(msg, "read:project") {
-			fmt.Fprintf(os.Stderr, "[Error] Project items の取得に read:project スコープが必要です。\n  → 次のコマンドを実行してください: gh auth refresh --scopes read:project\n")
+			fmt.Fprintf(os.Stderr, "[Error] Fetching project items requires the read:project scope.\n  → Run: gh auth refresh --scopes read:project\n")
 		} else {
 			fmt.Fprintf(os.Stderr, "[Error] Failed to fetch project items: %v\n", err)
 		}
@@ -386,26 +387,10 @@ func launchFzf(lines []string) {
 }
 
 func openURL(url string) {
-	type candidate struct {
-		cmd  string
-		args []string
+	b := browser.New("", os.Stdout, os.Stderr)
+	if err := b.Browse(url); err != nil {
+		fmt.Println("URL:", url)
 	}
-	candidates := []candidate{
-		{"wslview", []string{url}},
-		{"/mnt/c/Windows/System32/cmd.exe", []string{"/c", "start", "", url}},
-		{"/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", []string{"Start-Process", url}},
-	}
-
-	for _, c := range candidates {
-		cmd := exec.Command(c.cmd, c.args...)
-		cmd.Stdout = nil
-		cmd.Stderr = nil
-		if cmd.Run() == nil {
-			return
-		}
-	}
-
-	fmt.Println("URL:", url)
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
