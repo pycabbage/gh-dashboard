@@ -16,7 +16,7 @@ go build -o gh-dashboard .
 go generate ./gql/...
 
 # スキーマ再取得（go generate の前に必要な場合）
-curl https://docs.github.com/public/schema.docs.graphql -o gql/schema.graphql
+curl --fail-with-body https://docs.github.com/public/fpt/schema.docs.graphql -o gql/schema.graphql
 
 # 依存関係の整理
 go mod tidy
