@@ -33,17 +33,6 @@ func sectionHeader(label string) string {
 	return BOLD + YELLOW + "── " + label + " ──" + RESET
 }
 
-func itemLine(repoShort string, number int, title string, color string, itemType string) string {
-	var badge string
-	switch itemType {
-	case "pr":
-		badge = BLUE + "PR" + RESET + "  "
-	case "issue":
-		badge = GREEN + "IS" + RESET + "  "
-	}
-	return fmt.Sprintf("  %s%s%s  %s#%d%s  %s%s", color, repoShort, RESET, CYAN, number, RESET, badge, title)
-}
-
 func repoShortName(nameWithOwner string) string {
 	_, after, ok := strings.Cut(nameWithOwner, "/")
 	if ok {
@@ -61,27 +50,46 @@ func logMsg(msg string) {
 		return
 	}
 	ts := time.Now().Format(time.RFC3339)
-	fmt.Fprintf(logFile, "[%s] %s\n", ts, msg)
+	_, _ = fmt.Fprintf(logFile, "[%s] %s\n", ts, msg)
 }
 
 // ─── DashboardItem ───────────────────────────────────────────────────────────
 
+// DashboardItem holds raw display data. Formatting is deferred to buildLines
+// so all columns can be aligned in a single pass over all sections.
 type DashboardItem struct {
-	Display string
-	URL     string
+	Repo   string // short repo name (no owner prefix)
+	Number int
+	Badge  string // "PR" or "Issue"
+	Title  string
+	Color  string // ANSI color applied to the repo column
+	URL    string
+}
+
+func newItem(repo string, number int, badge, title, color, url string) DashboardItem {
+	return DashboardItem{
+		Repo:   repoShortName(repo),
+		Number: number,
+		Badge:  badge,
+		Title:  title,
+		Color:  color,
+		URL:    url,
+	}
 }
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
-func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting []DashboardItem, changesRequested []DashboardItem) {
+func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting, changesRequested, reviewed []DashboardItem) {
 	search1 := "is:pr is:open review-requested:" + login
 	search2 := "is:pr is:open review:changes_requested author:" + login
+	search3 := "is:pr is:open reviewed-by:" + login + " -author:" + login
 	if org != "" {
 		search1 += " org:" + org
 		search2 += " org:" + org
+		search3 += " org:" + org
 	}
 
-	resp, err := gql.FetchPRSections(context.Background(), gqlClient, search1, search2)
+	resp, err := gql.FetchPRSections(context.Background(), gqlClient, search1, search2, search3)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[Error] Failed to fetch PR sections: %v\n", err)
 		logMsg(fmt.Sprintf("fetchPRSections error: %v", err))
@@ -94,8 +102,7 @@ func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting []Da
 			continue
 		}
 		logMsg(fmt.Sprintf("awaiting: #%d %s", pr.Number, pr.Title))
-		short := repoShortName(pr.Repository.NameWithOwner)
-		awaiting = append(awaiting, DashboardItem{Display: itemLine(short, pr.Number, pr.Title, MAGENTA, "pr"), URL: pr.Url})
+		awaiting = append(awaiting, newItem(pr.Repository.NameWithOwner, pr.Number, "PR", pr.Title, MAGENTA, pr.Url))
 	}
 
 	for _, node := range resp.ChangesRequested.Nodes {
@@ -103,11 +110,18 @@ func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting []Da
 		if !ok || pr.Number == 0 {
 			continue
 		}
-		short := repoShortName(pr.Repository.NameWithOwner)
-		changesRequested = append(changesRequested, DashboardItem{Display: itemLine(short, pr.Number, pr.Title, YELLOW, "pr"), URL: pr.Url})
+		changesRequested = append(changesRequested, newItem(pr.Repository.NameWithOwner, pr.Number, "PR", pr.Title, YELLOW, pr.Url))
 	}
 
-	return awaiting, changesRequested
+	for _, node := range resp.Reviewed.Nodes {
+		pr, ok := node.(*gql.FetchPRSectionsReviewedSearchResultItemConnectionNodesPullRequest)
+		if !ok || pr.Number == 0 {
+			continue
+		}
+		reviewed = append(reviewed, newItem(pr.Repository.NameWithOwner, pr.Number, "PR", pr.Title, CYAN, pr.Url))
+	}
+
+	return
 }
 
 // projectItemData holds the common fields extracted from either query's item type.
@@ -122,8 +136,8 @@ type projectItemData struct {
 	itemType  string // "pr" or "issue"
 }
 
-// classifyProjectItem filters and appends a project item to ready or inProgress.
-func classifyProjectItem(d projectItemData, login string, ready, inProgress *[]DashboardItem) {
+// classifyProjectItem filters and appends a project item to ready, inReview, or inProgress.
+func classifyProjectItem(d projectItemData, login string, ready, inReview, inProgress *[]DashboardItem) {
 	logMsg(fmt.Sprintf("  item content: number=%d title=%q url=%s", d.number, d.title, d.url))
 
 	if d.number == 0 || d.title == "" || d.url == "" {
@@ -158,25 +172,33 @@ func classifyProjectItem(d projectItemData, login string, ready, inProgress *[]D
 	if repo == "" {
 		repo = "unknown/unknown"
 	}
-	dashItem := DashboardItem{Display: itemLine(repoShortName(repo), d.number, d.title, GREEN, d.itemType), URL: d.url}
+
+	badge := "PR"
+	if d.itemType == "issue" {
+		badge = "Issue"
+	}
+	item := newItem(repo, d.number, badge, d.title, GREEN, d.url)
 
 	statusLower := strings.ToLower(d.status)
 	switch {
 	case strings.Contains(statusLower, "ready"):
 		logMsg(fmt.Sprintf("  → Ready: #%d", d.number))
-		*ready = append(*ready, dashItem)
+		*ready = append(*ready, item)
+	case strings.Contains(statusLower, "in review"):
+		logMsg(fmt.Sprintf("  → In Review: #%d", d.number))
+		*inReview = append(*inReview, item)
 	case strings.Contains(statusLower, "in progress"):
 		logMsg(fmt.Sprintf("  → In Progress: #%d", d.number))
-		*inProgress = append(*inProgress, dashItem)
+		*inProgress = append(*inProgress, item)
 	default:
-		logMsg(fmt.Sprintf("  → skip: status=%q (not ready/in progress)", d.status))
+		logMsg(fmt.Sprintf("  → skip: status=%q (not ready/in review/in progress)", d.status))
 	}
 }
 
 func processOrgProjectItem(
 	item gql.FetchOrgProjectItemsOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2Item,
 	login string,
-	ready, inProgress *[]DashboardItem,
+	ready, inReview, inProgress *[]DashboardItem,
 ) {
 	content := item.Content
 	if content == nil {
@@ -216,13 +238,13 @@ func processOrgProjectItem(
 		}
 	}
 
-	classifyProjectItem(d, login, ready, inProgress)
+	classifyProjectItem(d, login, ready, inReview, inProgress)
 }
 
 func processViewerOrgProjectItem(
 	item gql.FetchViewerOrgProjectItemsViewerUserOrganizationsOrganizationConnectionNodesOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2Item,
 	login string,
-	ready, inProgress *[]DashboardItem,
+	ready, inReview, inProgress *[]DashboardItem,
 ) {
 	content := item.Content
 	if content == nil {
@@ -262,10 +284,10 @@ func processViewerOrgProjectItem(
 		}
 	}
 
-	classifyProjectItem(d, login, ready, inProgress)
+	classifyProjectItem(d, login, ready, inReview, inProgress)
 }
 
-func fetchProjectItems(gqlClient graphql.Client, login, org string) (ready []DashboardItem, inProgress []DashboardItem) {
+func fetchProjectItems(gqlClient graphql.Client, login, org string) (ready, inReview, inProgress []DashboardItem) {
 	handleErr := func(err error) bool {
 		if err == nil {
 			return false
@@ -288,7 +310,7 @@ func fetchProjectItems(gqlClient graphql.Client, login, org string) (ready []Das
 		for _, project := range resp.Organization.ProjectsV2.Nodes {
 			logMsg(fmt.Sprintf("Project: %q (%d items)", project.Title, len(project.Items.Nodes)))
 			for _, item := range project.Items.Nodes {
-				processOrgProjectItem(item, login, &ready, &inProgress)
+				processOrgProjectItem(item, login, &ready, &inReview, &inProgress)
 			}
 		}
 	} else {
@@ -300,42 +322,66 @@ func fetchProjectItems(gqlClient graphql.Client, login, org string) (ready []Das
 			for _, project := range orgNode.ProjectsV2.Nodes {
 				logMsg(fmt.Sprintf("Project: %q (%d items)", project.Title, len(project.Items.Nodes)))
 				for _, item := range project.Items.Nodes {
-					processViewerOrgProjectItem(item, login, &ready, &inProgress)
+					processViewerOrgProjectItem(item, login, &ready, &inReview, &inProgress)
 				}
 			}
 		}
 	}
 
-	return ready, inProgress
+	return ready, inReview, inProgress
 }
 
 // ─── Build fzf lines ──────────────────────────────────────────────────────────
 
-func appendSection(lines []string, header string, items []DashboardItem) []string {
-	lines = append(lines, sectionHeader(header)+"\t")
-	if len(items) == 0 {
-		lines = append(lines, "  (none)\t")
-	} else {
-		for _, item := range items {
-			lines = append(lines, item.Display+"\t"+item.URL)
-		}
-	}
-	return lines
+type section struct {
+	header string
+	items  []DashboardItem
 }
 
-func buildLines(awaiting, changesRequested, ready, inProgress []DashboardItem) []string {
-	sections := []struct {
-		header string
-		items  []DashboardItem
-	}{
-		{"Awaiting Approval", awaiting},
-		{"Changes Requested", changesRequested},
-		{"Ready", ready},
-		{"In Progress", inProgress},
+// formatItem renders a single item with pre-computed column widths.
+// Padding is applied to the plain-text values before adding ANSI codes,
+// so fmt.Sprintf width specifiers are not confused by escape sequence bytes.
+func formatItem(item DashboardItem, repoWidth, numWidth int) string {
+	repoPart := fmt.Sprintf("%-*s", repoWidth, item.Repo)
+	numStr := fmt.Sprintf("#%d", item.Number)
+	numPart := fmt.Sprintf("%*s", numWidth, numStr) // right-align
+	badgeColor := BLUE
+	if item.Badge == "Issue" {
+		badgeColor = GREEN
 	}
+	badgePart := fmt.Sprintf("%-5s", item.Badge) // "PR" → "PR   ", "Issue" → "Issue"
+	return fmt.Sprintf("  %s%s%s  %s%s%s  %s%s%s  %s",
+		item.Color, repoPart, RESET,
+		CYAN, numPart, RESET,
+		badgeColor, badgePart, RESET,
+		item.Title)
+}
+
+// buildLines formats all sections into tab-separated fzf lines.
+// First pass computes max column widths; second pass formats with consistent padding.
+func buildLines(sections []section) []string {
+	repoWidth, numWidth := 0, 0
+	for _, s := range sections {
+		for _, item := range s.items {
+			if n := len(item.Repo); n > repoWidth {
+				repoWidth = n
+			}
+			if n := len(fmt.Sprintf("#%d", item.Number)); n > numWidth {
+				numWidth = n
+			}
+		}
+	}
+
 	var lines []string
 	for i, s := range sections {
-		lines = appendSection(lines, s.header, s.items)
+		lines = append(lines, sectionHeader(s.header)+"\t")
+		if len(s.items) == 0 {
+			lines = append(lines, "  (none)\t")
+		} else {
+			for _, item := range s.items {
+				lines = append(lines, formatItem(item, repoWidth, numWidth)+"\t"+item.URL)
+			}
+		}
 		if i < len(sections)-1 {
 			lines = append(lines, "\t")
 		}
@@ -423,7 +469,7 @@ func launchFzf(lines []string) {
 	var outBuf strings.Builder
 	cmd.Stdout = &outBuf
 
-	err = cmd.Run()
+	_ = cmd.Run()
 	selected := strings.TrimSpace(outBuf.String())
 	if selected == "" {
 		return
@@ -462,7 +508,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[Error] Cannot open log file: %v\n", err)
 		} else {
 			logFile = f
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 		}
 	}
 
@@ -492,7 +538,9 @@ func main() {
 	var (
 		awaiting         []DashboardItem
 		changesRequested []DashboardItem
+		reviewed         []DashboardItem
 		ready            []DashboardItem
+		inReview         []DashboardItem
 		inProgress       []DashboardItem
 		wg               sync.WaitGroup
 	)
@@ -500,18 +548,26 @@ func main() {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		awaiting, changesRequested = fetchPRSections(gqlClient, login, *org)
+		awaiting, changesRequested, reviewed = fetchPRSections(gqlClient, login, *org)
 	}()
 	go func() {
 		defer wg.Done()
-		ready, inProgress = fetchProjectItems(gqlClient, login, *org)
+		ready, inReview, inProgress = fetchProjectItems(gqlClient, login, *org)
 	}()
 	wg.Wait()
 
-	logMsg(fmt.Sprintf("Summary: awaiting=%d changesRequested=%d ready=%d inProgress=%d",
-		len(awaiting), len(changesRequested), len(ready), len(inProgress)))
+	logMsg(fmt.Sprintf("Summary: awaiting=%d changesRequested=%d reviewed=%d ready=%d inReview=%d inProgress=%d",
+		len(awaiting), len(changesRequested), len(reviewed), len(ready), len(inReview), len(inProgress)))
 
-	lines := buildLines(awaiting, changesRequested, ready, inProgress)
+	sections := []section{
+		{"Awaiting Approval", awaiting},
+		{"Changes Requested", changesRequested},
+		{"Reviewed by Me", reviewed},
+		{"In Review", inReview},
+		{"Ready", ready},
+		{"In Progress", inProgress},
+	}
+	lines := buildLines(sections)
 
 	if *dryRun {
 		printPlain(lines)

@@ -55,19 +55,39 @@ gql/
 
 1. `api.NewHTTPClient` (go-gh) で認証済み HTTP クライアント生成 → `graphql.NewClient` に渡す
 2. `fetchPRSections` と `fetchProjectItems` を goroutine で並列実行
-3. `fetchPRSections`: 1クエリで `awaitingApproval`（レビュー依頼）・`changesRequested`（自分のPR、`review:changes_requested` で絞り込み済み）を同時取得
-4. `fetchProjectItems`: `--org` 指定あり → `FetchOrgProjectItems`、なし → `FetchViewerOrgProjectItems`（viewer の全所属 org を対象）
-5. `buildLines` で fzf 用の `{display}\t{url}` 形式の行を構築 → `launchFzf` に渡す
+3. `fetchPRSections`: 1クエリで `awaitingApproval`（レビュー依頼）・`changesRequested`（自分のPR、`review:changes_requested` で絞り込み済み）・`reviewed`（自分がレビュー済み、`reviewed-by` で取得）を同時取得し、3つのスライスを返す
+4. `fetchProjectItems`: `--org` 指定あり → `FetchOrgProjectItems`、なし → `FetchViewerOrgProjectItems`（viewer の全所属 org を対象）。`ready` / `inReview` / `inProgress` の3スライスを返す
+5. `buildLines` で `[]section` を受け取り、全アイテムのカラム幅を計算してから fzf 用の `{display}\t{url}` 形式の行を構築 → `launchFzf` に渡す
+
+### DashboardItem とカラム整列
+
+`DashboardItem` はフォーマット前の生データ（`Repo`, `Number`, `Badge`, `Title`, `Color`, `URL`）を保持する。`buildLines` が二パスで整列処理を行う：
+
+1. **第1パス**: 全セクションの全アイテムを走査し、リポジトリ名・番号文字列の最大表示幅を計算
+2. **第2パス**: `formatItem` で各アイテムをその幅にパディングして整形
+
+ANSI エスケープシーケンスを含むと `fmt.Sprintf` の幅指定が狂うため、プレーンテキストでパディングした後に色を付与する設計になっている。
 
 ### projectItemData パターン
 
-genqlient は クエリごとに異なる Go 型を生成するため、`FetchOrgProjectItems` と `FetchViewerOrgProjectItems` の item 型は別物。`processOrgProjectItem` / `processViewerOrgProjectItem` がそれぞれ型 switch でフィールドを抽出し、共通の `projectItemData` struct に詰め替えた後、`classifyProjectItem` で統一処理する。
+genqlient はクエリごとに異なる Go 型を生成するため、`FetchOrgProjectItems` と `FetchViewerOrgProjectItems` の item 型は別物。`processOrgProjectItem` / `processViewerOrgProjectItem` がそれぞれ型 switch でフィールドを抽出し、共通の `projectItemData` struct に詰め替えた後、`classifyProjectItem` で統一処理する。
 
 ### プロジェクトアイテムのフィルタ条件
 
 - `state == OPEN`
 - 自分がアサインされている
-- `Status` フィールドの値が `"ready"` または `"in progress"` を含む（case-insensitive）
+- `Status` フィールドの値が `"ready"` / `"in review"` / `"in progress"` のいずれかを含む（case-insensitive）
+
+### 表示セクション一覧
+
+| セクション | ソース | 絞り込み条件 |
+|-----------|--------|-------------|
+| Awaiting Approval | `fetchPRSections` | `is:pr is:open review-requested:{login}` |
+| Changes Requested | `fetchPRSections` | `is:pr is:open review:changes_requested author:{login}` |
+| Reviewed by Me | `fetchPRSections` | `is:pr is:open reviewed-by:{login} -author:{login}` |
+| In Review | `fetchProjectItems` | プロジェクトアイテム、Status に "in review" を含む |
+| Ready | `fetchProjectItems` | プロジェクトアイテム、Status に "ready" を含む |
+| In Progress | `fetchProjectItems` | プロジェクトアイテム、Status に "in progress" を含む |
 
 ### fzf のプレビューパネル
 

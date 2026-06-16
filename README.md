@@ -19,3 +19,32 @@ gh dashboard
 # Scope to a specific org
 gh dashboard --org <org-name>
 ```
+
+### Sections
+
+| Section | Contents |
+|---------|----------|
+| Awaiting Approval | PRs where your review has been requested |
+| Changes Requested | Your PRs that have received change requests |
+| Reviewed by Me | Open PRs you have already reviewed (excluding your own) |
+| In Review | Project items assigned to you with "In Review" status |
+| Ready | Project items assigned to you with "Ready" status |
+| In Progress | Project items assigned to you with "In Progress" status |
+
+### Preview panel
+
+After launching, use arrow keys to switch preview content:
+
+| Key | Content |
+|-----|---------|
+| default | Details (`gh pr view` / `gh issue view`) |
+| `→` | Comments |
+| `←` | Repository (`gh repo view`) |
+
+## Development
+
+### セットアップ
+
+```bash
+go tool lefthook install
+```
