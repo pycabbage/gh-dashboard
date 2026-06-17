@@ -655,6 +655,10 @@ func main() {
 	if *actor != "" {
 		login = *actor
 	}
+	if login == "" {
+		fmt.Fprintf(os.Stderr, "[Error] Failed to determine authenticated user\n")
+		os.Exit(1)
+	}
 	if fetchProjects {
 		ready, inReview, inProgress = processRawProjectItems(projRaw, login)
 	}
@@ -667,7 +671,7 @@ func main() {
 	if *actor != "" {
 		actorSuffix = " (as seen by: " + viewerLogin + ")"
 	}
-	fmt.Fprintf(os.Stderr, "[Info] Fetching dashboard for: %s%s%s\n", login, orgSuffix, actorSuffix)
+	fmt.Fprintf(os.Stderr, "[Info] Dashboard data for: %s%s%s\n", login, orgSuffix, actorSuffix)
 	logMsg(fmt.Sprintf("Actor: %s, Viewer: %s%s", login, viewerLogin, orgSuffix))
 
 	logMsg(fmt.Sprintf("Summary: awaiting=%d changesRequested=%d reviewed=%d ready=%d inReview=%d inProgress=%d",
