@@ -81,11 +81,11 @@ func newItem(repo string, number int, badge, title, color, url string) Dashboard
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
-func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting, changesRequested, reviewed, draftPRs []DashboardItem) {
-	search1 := "is:pr is:open review-requested:" + login
-	search2 := "is:pr is:open review:changes_requested author:" + login
-	search3 := "is:pr is:open reviewed-by:" + login + " -author:" + login
-	search4 := "is:pr is:open is:draft assignee:" + login
+func fetchPRSections(gqlClient graphql.Client, searchLogin, org string) (awaiting, changesRequested, reviewed, draftPRs []DashboardItem, viewerLogin string) {
+	search1 := "is:pr is:open review-requested:" + searchLogin
+	search2 := "is:pr is:open review:changes_requested author:" + searchLogin
+	search3 := "is:pr is:open reviewed-by:" + searchLogin + " -author:" + searchLogin
+	search4 := "is:pr is:open is:draft assignee:" + searchLogin
 	if org != "" {
 		search1 += " org:" + org
 		search2 += " org:" + org
@@ -99,6 +99,8 @@ func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting, cha
 		logMsg(fmt.Sprintf("fetchPRSections error: %v", err))
 		return
 	}
+
+	viewerLogin = resp.Viewer.Login
 
 	for _, node := range resp.AwaitingApproval.Nodes {
 		pr, ok := node.(*gql.FetchPRSectionsAwaitingApprovalSearchResultItemConnectionNodesPullRequest)
@@ -299,7 +301,13 @@ func processViewerOrgProjectItem(
 	classifyProjectItem(d, login, ready, inReview, inProgress)
 }
 
-func fetchProjectItems(gqlClient graphql.Client, login, org string) (ready, inReview, inProgress []DashboardItem) {
+type rawProjectResponse struct {
+	orgResp    *gql.FetchOrgProjectItemsResponse
+	viewerResp *gql.FetchViewerOrgProjectItemsResponse
+	err        error
+}
+
+func fetchProjectItemsRaw(gqlClient graphql.Client, org string) rawProjectResponse {
 	handleErr := func(err error) bool {
 		if err == nil {
 			return false
@@ -317,20 +325,30 @@ func fetchProjectItems(gqlClient graphql.Client, login, org string) (ready, inRe
 	if org != "" {
 		resp, err := gql.FetchOrgProjectItems(context.Background(), gqlClient, org)
 		if handleErr(err) {
-			return
+			return rawProjectResponse{err: err}
 		}
-		for _, project := range resp.Organization.ProjectsV2.Nodes {
+		return rawProjectResponse{orgResp: resp}
+	}
+	resp, err := gql.FetchViewerOrgProjectItems(context.Background(), gqlClient)
+	if handleErr(err) {
+		return rawProjectResponse{err: err}
+	}
+	return rawProjectResponse{viewerResp: resp}
+}
+
+func processRawProjectItems(raw rawProjectResponse, login string) (ready, inReview, inProgress []DashboardItem) {
+	if raw.err != nil {
+		return
+	}
+	if raw.orgResp != nil {
+		for _, project := range raw.orgResp.Organization.ProjectsV2.Nodes {
 			logMsg(fmt.Sprintf("Project: %q (%d items)", project.Title, len(project.Items.Nodes)))
 			for _, item := range project.Items.Nodes {
 				processOrgProjectItem(item, login, &ready, &inReview, &inProgress)
 			}
 		}
-	} else {
-		resp, err := gql.FetchViewerOrgProjectItems(context.Background(), gqlClient)
-		if handleErr(err) {
-			return
-		}
-		for _, orgNode := range resp.Viewer.Organizations.Nodes {
+	} else if raw.viewerResp != nil {
+		for _, orgNode := range raw.viewerResp.Viewer.Organizations.Nodes {
 			for _, project := range orgNode.ProjectsV2.Nodes {
 				logMsg(fmt.Sprintf("Project: %q (%d items)", project.Title, len(project.Items.Nodes)))
 				for _, item := range project.Items.Nodes {
@@ -339,8 +357,7 @@ func fetchProjectItems(gqlClient graphql.Client, login, org string) (ready, inRe
 			}
 		}
 	}
-
-	return ready, inReview, inProgress
+	return
 }
 
 // ─── Build fzf lines ──────────────────────────────────────────────────────────
@@ -598,15 +615,52 @@ func main() {
 	}
 	gqlClient := graphql.NewClient("https://api.github.com/graphql", httpClient)
 
-	viewerResp, err := gql.GetViewer(context.Background(), gqlClient)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[Error] Failed to get authenticated user: %v\n", err)
-		os.Exit(1)
+	// searchLogin is the identity used inside GitHub search strings.
+	// When --actor is set, use it directly (known from CLI flag).
+	// Otherwise use @me so FetchPRSections can start without a pre-flight GetViewer call.
+	searchLogin := "@me"
+	if *actor != "" {
+		searchLogin = *actor
 	}
-	viewerLogin := viewerResp.Viewer.Login
+
+	var (
+		awaiting         []DashboardItem
+		changesRequested []DashboardItem
+		reviewed         []DashboardItem
+		draftPRs         []DashboardItem
+		ready            []DashboardItem
+		inReview         []DashboardItem
+		inProgress       []DashboardItem
+		viewerLogin      string
+		projRaw          rawProjectResponse
+		wg               sync.WaitGroup
+	)
+
+	fetchProjects := *org != "" || *actor == ""
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		awaiting, changesRequested, reviewed, draftPRs, viewerLogin = fetchPRSections(gqlClient, searchLogin, *org)
+	}()
+	if fetchProjects {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			projRaw = fetchProjectItemsRaw(gqlClient, *org)
+		}()
+	}
+	wg.Wait()
+
 	login := viewerLogin
 	if *actor != "" {
 		login = *actor
+	}
+	if login == "" {
+		fmt.Fprintf(os.Stderr, "[Error] Failed to determine authenticated user\n")
+		os.Exit(1)
+	}
+	if fetchProjects {
+		ready, inReview, inProgress = processRawProjectItems(projRaw, login)
 	}
 
 	orgSuffix := ""
@@ -617,34 +671,8 @@ func main() {
 	if *actor != "" {
 		actorSuffix = " (as seen by: " + viewerLogin + ")"
 	}
-	fmt.Fprintf(os.Stderr, "[Info] Fetching dashboard for: %s%s%s\n", login, orgSuffix, actorSuffix)
+	fmt.Fprintf(os.Stderr, "[Info] Dashboard data for: %s%s%s\n", login, orgSuffix, actorSuffix)
 	logMsg(fmt.Sprintf("Actor: %s, Viewer: %s%s", login, viewerLogin, orgSuffix))
-
-	var (
-		awaiting         []DashboardItem
-		changesRequested []DashboardItem
-		reviewed         []DashboardItem
-		draftPRs         []DashboardItem
-		ready            []DashboardItem
-		inReview         []DashboardItem
-		inProgress       []DashboardItem
-		wg               sync.WaitGroup
-	)
-
-	fetchProjects := *org != "" || *actor == ""
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		awaiting, changesRequested, reviewed, draftPRs = fetchPRSections(gqlClient, login, *org)
-	}()
-	if fetchProjects {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ready, inReview, inProgress = fetchProjectItems(gqlClient, login, *org)
-		}()
-	}
-	wg.Wait()
 
 	logMsg(fmt.Sprintf("Summary: awaiting=%d changesRequested=%d reviewed=%d ready=%d inReview=%d inProgress=%d",
 		len(awaiting), len(changesRequested), len(reviewed), len(ready), len(inReview), len(inProgress)))
