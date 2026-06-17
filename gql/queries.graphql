@@ -1,10 +1,7 @@
-query GetViewer {
+query FetchPRSections($search1: String!, $search2: String!, $search3: String!, $search4: String!) {
   viewer {
     login
   }
-}
-
-query FetchPRSections($search1: String!, $search2: String!, $search3: String!, $search4: String!) {
   awaitingApproval: search(query: $search1, type: ISSUE, first: 50) {
     nodes {
       ... on PullRequest {
