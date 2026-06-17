@@ -4,7 +4,7 @@ query GetViewer {
   }
 }
 
-query FetchPRSections($search1: String!, $search2: String!, $search3: String!) {
+query FetchPRSections($search1: String!, $search2: String!, $search3: String!, $search4: String!) {
   awaitingApproval: search(query: $search1, type: ISSUE, first: 50) {
     nodes {
       ... on PullRequest {
@@ -31,6 +31,18 @@ query FetchPRSections($search1: String!, $search2: String!, $search3: String!) {
     }
   }
   reviewed: search(query: $search3, type: ISSUE, first: 50) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        repository {
+          nameWithOwner
+        }
+      }
+    }
+  }
+  myDraftPRs: search(query: $search4, type: ISSUE, first: 50) {
     nodes {
       ... on PullRequest {
         number

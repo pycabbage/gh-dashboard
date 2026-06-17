@@ -81,17 +81,19 @@ func newItem(repo string, number int, badge, title, color, url string) Dashboard
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
-func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting, changesRequested, reviewed []DashboardItem) {
+func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting, changesRequested, reviewed, draftPRs []DashboardItem) {
 	search1 := "is:pr is:open review-requested:" + login
 	search2 := "is:pr is:open review:changes_requested author:" + login
 	search3 := "is:pr is:open reviewed-by:" + login + " -author:" + login
+	search4 := "is:pr is:open is:draft assignee:" + login
 	if org != "" {
 		search1 += " org:" + org
 		search2 += " org:" + org
 		search3 += " org:" + org
+		search4 += " org:" + org
 	}
 
-	resp, err := gql.FetchPRSections(context.Background(), gqlClient, search1, search2, search3)
+	resp, err := gql.FetchPRSections(context.Background(), gqlClient, search1, search2, search3, search4)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[Error] Failed to fetch PR sections: %v\n", err)
 		logMsg(fmt.Sprintf("fetchPRSections error: %v", err))
@@ -121,6 +123,14 @@ func fetchPRSections(gqlClient graphql.Client, login, org string) (awaiting, cha
 			continue
 		}
 		reviewed = append(reviewed, newItem(pr.Repository.NameWithOwner, pr.Number, "PR", pr.Title, CYAN, pr.Url))
+	}
+
+	for _, node := range resp.MyDraftPRs.Nodes {
+		pr, ok := node.(*gql.FetchPRSectionsMyDraftPRsSearchResultItemConnectionNodesPullRequest)
+		if !ok || pr.Number == 0 {
+			continue
+		}
+		draftPRs = append(draftPRs, newItem(pr.Repository.NameWithOwner, pr.Number, "PR", pr.Title, BLUE, pr.Url))
 	}
 
 	return
@@ -566,6 +576,7 @@ func main() {
 	dryRun := flag.Bool("dry-run", false, "print plain text instead of launching fzf")
 	logPath := flag.String("log", "", "log file path")
 	org := flag.String("org", "", "GitHub organization to scope the dashboard to (optional)")
+	actor := flag.String("actor", "", "GitHub username to view the dashboard as")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -592,34 +603,47 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[Error] Failed to get authenticated user: %v\n", err)
 		os.Exit(1)
 	}
-	login := viewerResp.Viewer.Login
+	viewerLogin := viewerResp.Viewer.Login
+	login := viewerLogin
+	if *actor != "" {
+		login = *actor
+	}
 
 	orgSuffix := ""
 	if *org != "" {
 		orgSuffix = " (org: " + *org + ")"
 	}
-	fmt.Fprintf(os.Stderr, "[Info] Fetching dashboard for: %s%s\n", login, orgSuffix)
-	logMsg(fmt.Sprintf("Authenticated as: %s%s", login, orgSuffix))
+	actorSuffix := ""
+	if *actor != "" {
+		actorSuffix = " (as seen by: " + viewerLogin + ")"
+	}
+	fmt.Fprintf(os.Stderr, "[Info] Fetching dashboard for: %s%s%s\n", login, orgSuffix, actorSuffix)
+	logMsg(fmt.Sprintf("Actor: %s, Viewer: %s%s", login, viewerLogin, orgSuffix))
 
 	var (
 		awaiting         []DashboardItem
 		changesRequested []DashboardItem
 		reviewed         []DashboardItem
+		draftPRs         []DashboardItem
 		ready            []DashboardItem
 		inReview         []DashboardItem
 		inProgress       []DashboardItem
 		wg               sync.WaitGroup
 	)
 
-	wg.Add(2)
+	fetchProjects := *org != "" || *actor == ""
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		awaiting, changesRequested, reviewed = fetchPRSections(gqlClient, login, *org)
+		awaiting, changesRequested, reviewed, draftPRs = fetchPRSections(gqlClient, login, *org)
 	}()
-	go func() {
-		defer wg.Done()
-		ready, inReview, inProgress = fetchProjectItems(gqlClient, login, *org)
-	}()
+	if fetchProjects {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ready, inReview, inProgress = fetchProjectItems(gqlClient, login, *org)
+		}()
+	}
 	wg.Wait()
 
 	logMsg(fmt.Sprintf("Summary: awaiting=%d changesRequested=%d reviewed=%d ready=%d inReview=%d inProgress=%d",
@@ -628,10 +652,19 @@ func main() {
 	sections := []section{
 		{"Awaiting Approval", awaiting},
 		{"Changes Requested", changesRequested},
+		{"My Draft PRs", draftPRs},
 		{"Reviewed by Me", reviewed},
-		{"In Review", inReview},
-		{"Ready", ready},
-		{"In Progress", inProgress},
+	}
+	if fetchProjects {
+		sections = append(sections,
+			section{"In Review", inReview},
+			section{"Ready", ready},
+			section{"In Progress", inProgress},
+		)
+	}
+	if *actor != "" && *org == "" {
+		fmt.Fprintf(os.Stderr, "[Warning] Project item sections (In Review/Ready/In Progress) are skipped because --org is required when using --actor.\n")
+		fmt.Fprintf(os.Stderr, "          Use --org <org-name> to include project items.\n")
 	}
 	lines := buildLines(sections)
 
