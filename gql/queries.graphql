@@ -1,4 +1,4 @@
-query FetchPRSections($search1: String!, $search2: String!, $search3: String!, $search4: String!) {
+query FetchPRSections($search1: String!, $search2: String!, $search3: String!, $search4: String!, $search5: String!) {
   viewer {
     login
   }
@@ -47,6 +47,21 @@ query FetchPRSections($search1: String!, $search2: String!, $search3: String!, $
         url
         repository {
           nameWithOwner
+        }
+      }
+    }
+  }
+  myOpenPRs: search(query: $search5, type: ISSUE, first: 50) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        repository {
+          nameWithOwner
+        }
+        reviewRequests(first: 1) {
+          totalCount
         }
       }
     }

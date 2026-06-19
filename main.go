@@ -29,6 +29,7 @@ const (
 	GREEN   = "\x1b[32m"
 	MAGENTA = "\x1b[35m"
 	BLUE    = "\x1b[34m"
+	RED     = "\x1b[31m"
 )
 
 func sectionHeader(label string) string {
@@ -81,19 +82,21 @@ func newItem(repo string, number int, badge, title, color, url string) Dashboard
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
-func fetchPRSections(gqlClient graphql.Client, searchLogin, org string) (awaiting, changesRequested, reviewed, draftPRs []DashboardItem, viewerLogin string) {
+func fetchPRSections(gqlClient graphql.Client, searchLogin, org string) (awaiting, changesRequested, reviewed, draftPRs, noReviewPRs []DashboardItem, viewerLogin string) {
 	search1 := "is:pr is:open review-requested:" + searchLogin
 	search2 := "is:pr is:open review:changes_requested author:" + searchLogin
 	search3 := "is:pr is:open reviewed-by:" + searchLogin + " -author:" + searchLogin
 	search4 := "is:pr is:open is:draft assignee:" + searchLogin
+	search5 := "is:pr is:open author:" + searchLogin + " -is:draft"
 	if org != "" {
 		search1 += " org:" + org
 		search2 += " org:" + org
 		search3 += " org:" + org
 		search4 += " org:" + org
+		search5 += " org:" + org
 	}
 
-	resp, err := gql.FetchPRSections(context.Background(), gqlClient, search1, search2, search3, search4)
+	resp, err := gql.FetchPRSections(context.Background(), gqlClient, search1, search2, search3, search4, search5)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[Error] Failed to fetch PR sections: %v\n", err)
 		logMsg(fmt.Sprintf("fetchPRSections error: %v", err))
@@ -133,6 +136,17 @@ func fetchPRSections(gqlClient graphql.Client, searchLogin, org string) (awaitin
 			continue
 		}
 		draftPRs = append(draftPRs, newItem(pr.Repository.NameWithOwner, pr.Number, "PR", pr.Title, BLUE, pr.Url))
+	}
+
+	for _, node := range resp.MyOpenPRs.Nodes {
+		pr, ok := node.(*gql.FetchPRSectionsMyOpenPRsSearchResultItemConnectionNodesPullRequest)
+		if !ok || pr.Number == 0 {
+			continue
+		}
+		if pr.ReviewRequests.TotalCount == 0 {
+			logMsg(fmt.Sprintf("noReviewPRs: #%d %s", pr.Number, pr.Title))
+			noReviewPRs = append(noReviewPRs, newItem(pr.Repository.NameWithOwner, pr.Number, "PR", pr.Title, RED, pr.Url))
+		}
 	}
 
 	return
@@ -628,6 +642,7 @@ func main() {
 		changesRequested []DashboardItem
 		reviewed         []DashboardItem
 		draftPRs         []DashboardItem
+		noReviewPRs      []DashboardItem
 		ready            []DashboardItem
 		inReview         []DashboardItem
 		inProgress       []DashboardItem
@@ -640,7 +655,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		awaiting, changesRequested, reviewed, draftPRs, viewerLogin = fetchPRSections(gqlClient, searchLogin, *org)
+		awaiting, changesRequested, reviewed, draftPRs, noReviewPRs, viewerLogin = fetchPRSections(gqlClient, searchLogin, *org)
 	}()
 	if fetchProjects {
 		wg.Add(1)
@@ -674,12 +689,13 @@ func main() {
 	fmt.Fprintf(os.Stderr, "[Info] Dashboard data for: %s%s%s\n", login, orgSuffix, actorSuffix)
 	logMsg(fmt.Sprintf("Actor: %s, Viewer: %s%s", login, viewerLogin, orgSuffix))
 
-	logMsg(fmt.Sprintf("Summary: awaiting=%d changesRequested=%d reviewed=%d ready=%d inReview=%d inProgress=%d",
-		len(awaiting), len(changesRequested), len(reviewed), len(ready), len(inReview), len(inProgress)))
+	logMsg(fmt.Sprintf("Summary: awaiting=%d changesRequested=%d reviewed=%d noReviewPRs=%d ready=%d inReview=%d inProgress=%d",
+		len(awaiting), len(changesRequested), len(reviewed), len(noReviewPRs), len(ready), len(inReview), len(inProgress)))
 
 	sections := []section{
 		{"Awaiting Approval", awaiting},
 		{"Changes Requested", changesRequested},
+		{"No Review Requested", noReviewPRs},
 		{"My Draft PRs", draftPRs},
 		{"Reviewed by Me", reviewed},
 	}
