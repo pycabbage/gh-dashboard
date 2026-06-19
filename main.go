@@ -16,6 +16,7 @@ import (
 	"github.com/Khan/genqlient/graphql"
 	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/cli/go-gh/v2/pkg/browser"
+	"github.com/cli/go-gh/v2/pkg/repository"
 	gql "github.com/pycabbage/gh-dashboard/gql"
 )
 
@@ -82,7 +83,7 @@ func newItem(repo string, number int, badge, title, color, url string) Dashboard
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
-func fetchPRSections(gqlClient graphql.Client, searchLogin, org string) (awaiting, changesRequested, reviewed, draftPRs, noReviewPRs []DashboardItem, viewerLogin string) {
+func fetchPRSections(gqlClient graphql.Client, searchLogin, org, repo string) (awaiting, changesRequested, reviewed, draftPRs, noReviewPRs []DashboardItem, viewerLogin string) {
 	search1 := "is:pr is:open review-requested:" + searchLogin
 	search2 := "is:pr is:open review:changes_requested author:" + searchLogin
 	search3 := "is:pr is:open reviewed-by:" + searchLogin + " -author:" + searchLogin
@@ -94,6 +95,13 @@ func fetchPRSections(gqlClient graphql.Client, searchLogin, org string) (awaitin
 		search3 += " org:" + org
 		search4 += " org:" + org
 		search5 += " org:" + org
+	}
+	if repo != "" {
+		search1 += " repo:" + repo
+		search2 += " repo:" + repo
+		search3 += " repo:" + repo
+		search4 += " repo:" + repo
+		search5 += " repo:" + repo
 	}
 
 	resp, err := gql.FetchPRSections(context.Background(), gqlClient, search1, search2, search3, search4, search5)
@@ -165,7 +173,7 @@ type projectItemData struct {
 }
 
 // classifyProjectItem filters and appends a project item to ready, inReview, or inProgress.
-func classifyProjectItem(d projectItemData, login string, ready, inReview, inProgress *[]DashboardItem) {
+func classifyProjectItem(d projectItemData, login, repoFilter string, ready, inReview, inProgress *[]DashboardItem) {
 	logMsg(fmt.Sprintf("  item content: number=%d title=%q url=%s", d.number, d.title, d.url))
 
 	if d.number == 0 || d.title == "" || d.url == "" {
@@ -174,6 +182,10 @@ func classifyProjectItem(d projectItemData, login string, ready, inReview, inPro
 	}
 	if !d.stateOpen {
 		logMsg("  → skip: not open")
+		return
+	}
+	if repoFilter != "" && !strings.EqualFold(d.repo, repoFilter) {
+		logMsg(fmt.Sprintf("  → skip: repo %q doesn't match filter %q", d.repo, repoFilter))
 		return
 	}
 
@@ -225,7 +237,7 @@ func classifyProjectItem(d projectItemData, login string, ready, inReview, inPro
 
 func processOrgProjectItem(
 	item gql.FetchOrgProjectItemsOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2Item,
-	login string,
+	login, repoFilter string,
 	ready, inReview, inProgress *[]DashboardItem,
 ) {
 	content := item.Content
@@ -266,12 +278,12 @@ func processOrgProjectItem(
 		}
 	}
 
-	classifyProjectItem(d, login, ready, inReview, inProgress)
+	classifyProjectItem(d, login, repoFilter, ready, inReview, inProgress)
 }
 
 func processViewerOrgProjectItem(
 	item gql.FetchViewerOrgProjectItemsViewerUserOrganizationsOrganizationConnectionNodesOrganizationProjectsV2ProjectV2ConnectionNodesProjectV2ItemsProjectV2ItemConnectionNodesProjectV2Item,
-	login string,
+	login, repoFilter string,
 	ready, inReview, inProgress *[]DashboardItem,
 ) {
 	content := item.Content
@@ -312,7 +324,7 @@ func processViewerOrgProjectItem(
 		}
 	}
 
-	classifyProjectItem(d, login, ready, inReview, inProgress)
+	classifyProjectItem(d, login, repoFilter, ready, inReview, inProgress)
 }
 
 type rawProjectResponse struct {
@@ -350,7 +362,7 @@ func fetchProjectItemsRaw(gqlClient graphql.Client, org string) rawProjectRespon
 	return rawProjectResponse{viewerResp: resp}
 }
 
-func processRawProjectItems(raw rawProjectResponse, login string) (ready, inReview, inProgress []DashboardItem) {
+func processRawProjectItems(raw rawProjectResponse, login, repoFilter string) (ready, inReview, inProgress []DashboardItem) {
 	if raw.err != nil {
 		return
 	}
@@ -358,7 +370,7 @@ func processRawProjectItems(raw rawProjectResponse, login string) (ready, inRevi
 		for _, project := range raw.orgResp.Organization.ProjectsV2.Nodes {
 			logMsg(fmt.Sprintf("Project: %q (%d items)", project.Title, len(project.Items.Nodes)))
 			for _, item := range project.Items.Nodes {
-				processOrgProjectItem(item, login, &ready, &inReview, &inProgress)
+				processOrgProjectItem(item, login, repoFilter, &ready, &inReview, &inProgress)
 			}
 		}
 	} else if raw.viewerResp != nil {
@@ -366,7 +378,7 @@ func processRawProjectItems(raw rawProjectResponse, login string) (ready, inRevi
 			for _, project := range orgNode.ProjectsV2.Nodes {
 				logMsg(fmt.Sprintf("Project: %q (%d items)", project.Title, len(project.Items.Nodes)))
 				for _, item := range project.Items.Nodes {
-					processViewerOrgProjectItem(item, login, &ready, &inReview, &inProgress)
+					processViewerOrgProjectItem(item, login, repoFilter, &ready, &inReview, &inProgress)
 				}
 			}
 		}
@@ -608,7 +620,30 @@ func main() {
 	logPath := flag.String("log", "", "log file path")
 	org := flag.String("org", "", "GitHub organization to scope the dashboard to (optional)")
 	actor := flag.String("actor", "", "GitHub username to view the dashboard as")
+	var repoFilter string
+	flag.StringVar(&repoFilter, "repo", "", "show only items from this repository (owner/repo)")
+	flag.StringVar(&repoFilter, "R", "", "show only items from this repository (owner/repo)")
+	var showAll bool
+	flag.BoolVar(&showAll, "all", false, "show all repositories (default: current repository only)")
+	flag.BoolVar(&showAll, "a", false, "show all repositories (default: current repository only)")
 	flag.Parse()
+
+	if !showAll {
+		if repoFilter != "" {
+			if !strings.Contains(repoFilter, "/") {
+				fmt.Fprintf(os.Stderr, "[Error] --repo/-R must be in owner/repo format (got %q)\n", repoFilter)
+				os.Exit(1)
+			}
+		} else {
+			currentRepo, err := repository.Current()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[Error] Not in a GitHub repository.\n")
+				fmt.Fprintf(os.Stderr, "        Use --repo/-R <owner/repo> to specify a repository, or --all/-a to show all.\n")
+				os.Exit(1)
+			}
+			repoFilter = currentRepo.Owner + "/" + currentRepo.Name
+		}
+	}
 
 	if *logPath != "" {
 		f, err := os.OpenFile(*logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -655,7 +690,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		awaiting, changesRequested, reviewed, draftPRs, noReviewPRs, viewerLogin = fetchPRSections(gqlClient, searchLogin, *org)
+		awaiting, changesRequested, reviewed, draftPRs, noReviewPRs, viewerLogin = fetchPRSections(gqlClient, searchLogin, *org, repoFilter)
 	}()
 	if fetchProjects {
 		wg.Add(1)
@@ -675,19 +710,23 @@ func main() {
 		os.Exit(1)
 	}
 	if fetchProjects {
-		ready, inReview, inProgress = processRawProjectItems(projRaw, login)
+		ready, inReview, inProgress = processRawProjectItems(projRaw, login, repoFilter)
 	}
 
 	orgSuffix := ""
 	if *org != "" {
 		orgSuffix = " (org: " + *org + ")"
 	}
+	repoSuffix := ""
+	if repoFilter != "" {
+		repoSuffix = " (repo: " + repoFilter + ")"
+	}
 	actorSuffix := ""
 	if *actor != "" {
 		actorSuffix = " (as seen by: " + viewerLogin + ")"
 	}
-	fmt.Fprintf(os.Stderr, "[Info] Dashboard data for: %s%s%s\n", login, orgSuffix, actorSuffix)
-	logMsg(fmt.Sprintf("Actor: %s, Viewer: %s%s", login, viewerLogin, orgSuffix))
+	fmt.Fprintf(os.Stderr, "[Info] Dashboard data for: %s%s%s%s\n", login, orgSuffix, repoSuffix, actorSuffix)
+	logMsg(fmt.Sprintf("Actor: %s, Viewer: %s%s%s", login, viewerLogin, orgSuffix, repoSuffix))
 
 	logMsg(fmt.Sprintf("Summary: awaiting=%d changesRequested=%d reviewed=%d noReviewPRs=%d ready=%d inReview=%d inProgress=%d",
 		len(awaiting), len(changesRequested), len(reviewed), len(noReviewPRs), len(ready), len(inReview), len(inProgress)))
