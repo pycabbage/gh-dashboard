@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -89,20 +90,24 @@ func fetchPRSections(gqlClient graphql.Client, searchLogin, org, repo string) (a
 	search3 := "is:pr is:open reviewed-by:" + searchLogin + " -author:" + searchLogin
 	search4 := "is:pr is:open is:draft assignee:" + searchLogin
 	search5 := "is:pr is:open author:" + searchLogin + " -is:draft"
-	if org != "" {
-		search1 += " org:" + org
-		search2 += " org:" + org
-		search3 += " org:" + org
-		search4 += " org:" + org
-		search5 += " org:" + org
-	}
+	// GitHub's search API silently drops "repo:" when "org:" is also present in
+	// the same query (verified empirically: identical result sets with and
+	// without "repo:" once "org:" is present), so repo takes precedence and org
+	// is only added when repo is absent.
 	if repo != "" {
 		search1 += " repo:" + repo
 		search2 += " repo:" + repo
 		search3 += " repo:" + repo
 		search4 += " repo:" + repo
 		search5 += " repo:" + repo
+	} else if org != "" {
+		search1 += " org:" + org
+		search2 += " org:" + org
+		search3 += " org:" + org
+		search4 += " org:" + org
+		search5 += " org:" + org
 	}
+	logMsg(fmt.Sprintf("PR search queries: awaiting=%q changesRequested=%q reviewed=%q draftPRs=%q noReviewPRs=%q", search1, search2, search3, search4, search5))
 
 	resp, err := gql.FetchPRSections(context.Background(), gqlClient, search1, search2, search3, search4, search5)
 	if err != nil {
@@ -189,13 +194,7 @@ func classifyProjectItem(d projectItemData, login, repoFilter string, ready, inR
 		return
 	}
 
-	isAssigned := false
-	for _, l := range d.logins {
-		if l == login {
-			isAssigned = true
-			break
-		}
-	}
+	isAssigned := slices.Contains(d.logins, login)
 	logMsg(fmt.Sprintf("  assignees: %v isAssigned=%v", d.logins, isAssigned))
 	if !isAssigned {
 		logMsg("  → skip: not assigned")
@@ -333,7 +332,7 @@ type rawProjectResponse struct {
 	err        error
 }
 
-func fetchProjectItemsRaw(gqlClient graphql.Client, org string) rawProjectResponse {
+func fetchProjectItemsRaw(gqlClient graphql.Client, org, itemQuery string) rawProjectResponse {
 	handleErr := func(err error) bool {
 		if err == nil {
 			return false
@@ -349,13 +348,13 @@ func fetchProjectItemsRaw(gqlClient graphql.Client, org string) rawProjectRespon
 	}
 
 	if org != "" {
-		resp, err := gql.FetchOrgProjectItems(context.Background(), gqlClient, org)
+		resp, err := gql.FetchOrgProjectItems(context.Background(), gqlClient, org, itemQuery)
 		if handleErr(err) {
 			return rawProjectResponse{err: err}
 		}
 		return rawProjectResponse{orgResp: resp}
 	}
-	resp, err := gql.FetchViewerOrgProjectItems(context.Background(), gqlClient)
+	resp, err := gql.FetchViewerOrgProjectItems(context.Background(), gqlClient, itemQuery)
 	if handleErr(err) {
 		return rawProjectResponse{err: err}
 	}
@@ -613,6 +612,18 @@ func openURL(url string) {
 	}
 }
 
+// isOrganization reports whether login belongs to a GitHub organization
+// account (as opposed to a personal user account).
+func isOrganization(restClient *api.RESTClient, login string) (bool, error) {
+	var resp struct {
+		Type string `json:"type"`
+	}
+	if err := restClient.Get("users/"+login, &resp); err != nil {
+		return false, err
+	}
+	return resp.Type == "Organization", nil
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -634,7 +645,11 @@ func main() {
 				fmt.Fprintf(os.Stderr, "[Error] --repo/-R must be in owner/repo format (got %q)\n", repoFilter)
 				os.Exit(1)
 			}
-		} else {
+		} else if *org == "" {
+			// Only auto-detect the current directory's repo when --org wasn't
+			// explicitly given. Otherwise "--org X" run inside a repo directory
+			// would get silently narrowed down to just that repo instead of
+			// scoping to the whole org, which is what --org is documented to do.
 			currentRepo, err := repository.Current()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "[Error] Not in a GitHub repository.\n")
@@ -656,6 +671,24 @@ func main() {
 	}
 
 	logMsg(fmt.Sprintf("Starting gh-dashboard (dry-run=%v)", *dryRun))
+
+	// When a repo is known but no org was given, try to infer the org from the
+	// repo's owner so project item fetching can use the more complete,
+	// higher-limit org-scoped query instead of iterating every org the viewer
+	// belongs to. Best-effort: any lookup failure just leaves org unset, which
+	// falls back to the existing viewer-wide behavior.
+	if repoFilter != "" && *org == "" && *actor == "" {
+		if owner, _, ok := strings.Cut(repoFilter, "/"); ok {
+			if restClient, err := api.NewRESTClient(api.ClientOptions{}); err != nil {
+				logMsg(fmt.Sprintf("org auto-detection: failed to create REST client: %v", err))
+			} else if orgOwner, err := isOrganization(restClient, owner); err != nil {
+				logMsg(fmt.Sprintf("org auto-detection: lookup for %q failed: %v", owner, err))
+			} else if orgOwner {
+				*org = owner
+				logMsg(fmt.Sprintf("Auto-detected org %q from repo %q", owner, repoFilter))
+			}
+		}
+	}
 
 	httpClient, err := api.NewHTTPClient(api.ClientOptions{})
 	if err != nil {
@@ -687,17 +720,13 @@ func main() {
 	)
 
 	fetchProjects := *org != "" || *actor == ""
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		awaiting, changesRequested, reviewed, draftPRs, noReviewPRs, viewerLogin = fetchPRSections(gqlClient, searchLogin, *org, repoFilter)
-	}()
+	})
 	if fetchProjects {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			projRaw = fetchProjectItemsRaw(gqlClient, *org)
-		}()
+		wg.Go(func() {
+			projRaw = fetchProjectItemsRaw(gqlClient, *org, "assignee:"+searchLogin)
+		})
 	}
 	wg.Wait()
 
